@@ -136,6 +136,24 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
+            cli::NbdCommands::Snapshot {
+                mount_point,
+                name,
+                subvolume,
+                readonly,
+            } => {
+                cli::nbd::create_snapshot(mount_point, name, subvolume, readonly).await?;
+            }
+            cli::NbdCommands::ListSnapshots { mount_point } => {
+                cli::nbd::list_snapshots(mount_point).await?;
+            }
+            cli::NbdCommands::DeleteSnapshot {
+                mount_point,
+                name,
+                force,
+            } => {
+                cli::nbd::delete_snapshot(mount_point, name, force).await?;
+            }
         },
     }
 

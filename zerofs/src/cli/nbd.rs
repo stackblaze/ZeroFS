@@ -5,6 +5,7 @@ use crate::fs::{CacheConfig, ZeroFS};
 use crate::key_management;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
+use chrono;
 use comfy_table::{Cell, Color, Table};
 use num_format::{Locale, ToFormattedString};
 use std::io::Write;
@@ -540,6 +541,178 @@ pub async fn export_device(
     }
     println!();
     println!("⚠️  Important: Ensure ZeroFS server is running before system boot!");
+
+    Ok(())
+}
+
+pub async fn create_snapshot(
+    mount_point: PathBuf,
+    name: Option<String>,
+    subvolume: String,
+    readonly: bool,
+) -> Result<()> {
+    use std::process::Command;
+
+    // Generate snapshot name if not provided
+    let snapshot_name = name.unwrap_or_else(|| {
+        format!("snapshot-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"))
+    });
+
+    let source_path = format!("{}/{}", mount_point.display(), subvolume);
+    let snapshot_path = format!("{}/@snapshots/{}", mount_point.display(), snapshot_name);
+
+    println!("📸 Creating snapshot...");
+    println!("  Source: {}", source_path);
+    println!("  Snapshot: {}", snapshot_path);
+    if readonly {
+        println!("  Mode: Read-only");
+    }
+
+    // Check if source exists
+    if !std::path::Path::new(&source_path).exists() {
+        anyhow::bail!("Source subvolume does not exist: {}", source_path);
+    }
+
+    // Create snapshot
+    let mut cmd = Command::new("btrfs");
+    cmd.args(&["subvolume", "snapshot"]);
+    
+    if readonly {
+        cmd.arg("-r");
+    }
+    
+    cmd.args(&[&source_path, &snapshot_path]);
+
+    let output = cmd.output()
+        .context("Failed to execute btrfs command. Is btrfs-progs installed?")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to create snapshot:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    println!("✅ Snapshot created successfully!");
+    println!("\n📊 Snapshot details:");
+    println!("  Name: {}", snapshot_name);
+    println!("  Path: {}", snapshot_path);
+    println!("  Type: {}", if readonly { "Read-only" } else { "Read-write" });
+    println!("\n💡 Access snapshot:");
+    println!("  Local: ls {}", snapshot_path);
+    println!("  NFS clients: ls /mnt/remote/@snapshots/{}", snapshot_name);
+    println!("\n🔄 Restore file:");
+    println!("  cp {}/myfile.txt {}/myfile.txt.restored", 
+        snapshot_path, source_path);
+
+    Ok(())
+}
+
+pub async fn list_snapshots(mount_point: PathBuf) -> Result<()> {
+    use std::process::Command;
+
+    println!("📋 Listing snapshots for {}...\n", mount_point.display());
+
+    // List all subvolumes
+    let output = Command::new("btrfs")
+        .args(&["subvolume", "list", mount_point.to_str().unwrap()])
+        .output()
+        .context("Failed to execute btrfs command. Is btrfs-progs installed?")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to list subvolumes:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    
+    // Filter for snapshots in @snapshots directory
+    let snapshots: Vec<&str> = output_str
+        .lines()
+        .filter(|line| line.contains("@snapshots/"))
+        .collect();
+
+    if snapshots.is_empty() {
+        println!("No snapshots found in {}/@snapshots/", mount_point.display());
+        println!("\n💡 Create a snapshot with:");
+        println!("  zerofs nbd snapshot --mount-point {}", mount_point.display());
+        return Ok(());
+    }
+
+    // Create table
+    let mut table = Table::new();
+    table.set_header(vec![
+        Cell::new("SNAPSHOT NAME").fg(Color::Green),
+        Cell::new("ID").fg(Color::Green),
+        Cell::new("PATH").fg(Color::Green),
+    ]);
+
+    for line in snapshots {
+        // Parse btrfs output: "ID 258 gen 42 top level 5 path @snapshots/snapshot-20251202"
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 9 {
+            let id = parts[1];
+            let full_path = parts[8];
+            
+            // Extract just the snapshot name
+            if let Some(name) = full_path.strip_prefix("@snapshots/") {
+                table.add_row(vec![
+                    Cell::new(name),
+                    Cell::new(id),
+                    Cell::new(format!("{}/@snapshots/{}", mount_point.display(), name)),
+                ]);
+            }
+        }
+    }
+
+    println!("{}", table);
+    println!("\n💡 Delete snapshot:");
+    println!("  zerofs nbd delete-snapshot --mount-point {} --name <snapshot-name> --force",
+        mount_point.display());
+
+    Ok(())
+}
+
+pub async fn delete_snapshot(
+    mount_point: PathBuf,
+    name: String,
+    force: bool,
+) -> Result<()> {
+    use std::process::Command;
+
+    let snapshot_path = format!("{}/@snapshots/{}", mount_point.display(), name);
+
+    // Check if snapshot exists
+    if !std::path::Path::new(&snapshot_path).exists() {
+        anyhow::bail!("Snapshot does not exist: {}", snapshot_path);
+    }
+
+    if !force {
+        println!("⚠️  WARNING: This will permanently delete the snapshot!");
+        println!("  Snapshot: {}", snapshot_path);
+        println!("\nUse --force to confirm deletion.");
+        anyhow::bail!("Deletion cancelled");
+    }
+
+    println!("🗑️  Deleting snapshot: {}", name);
+
+    let output = Command::new("btrfs")
+        .args(&["subvolume", "delete", &snapshot_path])
+        .output()
+        .context("Failed to execute btrfs command")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to delete snapshot:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    println!("✅ Snapshot deleted successfully!");
+    println!("  Name: {}", name);
+    println!("  Path: {}", snapshot_path);
 
     Ok(())
 }

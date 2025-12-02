@@ -165,6 +165,38 @@ pub enum NbdCommands {
         #[arg(long, default_value = "10809")]
         nbd_port: u16,
     },
+    /// Create a btrfs snapshot
+    Snapshot {
+        /// Mount point of the btrfs filesystem
+        #[arg(long)]
+        mount_point: PathBuf,
+        /// Snapshot name (optional, defaults to timestamp)
+        #[arg(long)]
+        name: Option<String>,
+        /// Source subvolume to snapshot (default: @)
+        #[arg(long, default_value = "@")]
+        subvolume: String,
+        /// Create read-only snapshot
+        #[arg(long)]
+        readonly: bool,
+    },
+    /// List btrfs snapshots
+    ListSnapshots {
+        /// Mount point of the btrfs filesystem
+        #[arg(long)]
+        mount_point: PathBuf,
+    },
+    /// Delete a btrfs snapshot
+    DeleteSnapshot {
+        /// Mount point of the btrfs filesystem
+        #[arg(long)]
+        mount_point: PathBuf,
+        /// Snapshot name to delete
+        name: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 impl Cli {
