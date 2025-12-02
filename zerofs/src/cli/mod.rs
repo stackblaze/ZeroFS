@@ -135,6 +135,36 @@ pub enum NbdCommands {
         /// New size (e.g., 10G, 512M, 1T)
         size: String,
     },
+    /// Export NBD device as formatted filesystem via NFS
+    Export {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name to export
+        name: String,
+        /// Device size (e.g., 10G, 512M, 1T)
+        size: String,
+        /// NBD device to use (e.g., /dev/nbd0)
+        #[arg(long, default_value = "/dev/nbd0")]
+        nbd_device: String,
+        /// Filesystem type (ext4, xfs, zfs)
+        #[arg(long, default_value = "ext4")]
+        filesystem: String,
+        /// Mount point for the filesystem
+        #[arg(long)]
+        mount_point: PathBuf,
+        /// NFS export path (defaults to mount point)
+        #[arg(long)]
+        nfs_export: Option<String>,
+        /// NFS export options
+        #[arg(long, default_value = "rw,sync,no_subtree_check")]
+        nfs_options: String,
+        /// ZeroFS server address for NBD connection
+        #[arg(long, default_value = "127.0.0.1")]
+        nbd_host: String,
+        /// ZeroFS NBD port
+        #[arg(long, default_value = "10809")]
+        nbd_port: u16,
+    },
 }
 
 impl Cli {

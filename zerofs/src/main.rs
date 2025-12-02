@@ -110,6 +110,32 @@ async fn main() -> Result<()> {
             cli::NbdCommands::Resize { config, name, size } => {
                 cli::nbd::resize_device(config, name, size).await?;
             }
+            cli::NbdCommands::Export {
+                config,
+                name,
+                size,
+                nbd_device,
+                filesystem,
+                mount_point,
+                nfs_export,
+                nfs_options,
+                nbd_host,
+                nbd_port,
+            } => {
+                cli::nbd::export_device(
+                    config,
+                    name,
+                    size,
+                    nbd_device,
+                    filesystem,
+                    mount_point,
+                    nfs_export,
+                    nfs_options,
+                    nbd_host,
+                    nbd_port,
+                )
+                .await?;
+            }
         },
     }
 

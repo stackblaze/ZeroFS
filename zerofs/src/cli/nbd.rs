@@ -7,6 +7,7 @@ use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use comfy_table::{Cell, Color, Table};
 use num_format::{Locale, ToFormattedString};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -342,6 +343,160 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{} bytes", bytes)
     }
+}
+
+pub async fn export_device(
+    config: PathBuf,
+    name: String,
+    size: String,
+    nbd_device: String,
+    filesystem: String,
+    mount_point: PathBuf,
+    nfs_export: Option<String>,
+    nfs_options: String,
+    nbd_host: String,
+    nbd_port: u16,
+) -> Result<()> {
+    use std::process::Command;
+
+    println!("🚀 Starting NBD device export workflow...\n");
+
+    // Step 1: Create NBD device in ZeroFS
+    println!("📦 Step 1/6: Creating NBD device '{}'...", name);
+    create_device(config.clone(), name.clone(), size.clone()).await?;
+    println!();
+
+    // Step 2: Connect NBD client
+    println!("🔌 Step 2/6: Connecting NBD client to {}...", nbd_device);
+    let nbd_connect = Command::new("nbd-client")
+        .args(&[
+            &nbd_host,
+            &nbd_port.to_string(),
+            &nbd_device,
+            "-N",
+            &name,
+            "-persist",
+        ])
+        .output()
+        .context("Failed to execute nbd-client. Is it installed? (apt install nbd-client)")?;
+
+    if !nbd_connect.status.success() {
+        anyhow::bail!(
+            "Failed to connect NBD client:\n{}",
+            String::from_utf8_lossy(&nbd_connect.stderr)
+        );
+    }
+    println!("✓ NBD device connected: {}", nbd_device);
+    println!();
+
+    // Step 3: Format the device
+    println!("💾 Step 3/6: Formatting {} as {}...", nbd_device, filesystem);
+    let format_result = match filesystem.as_str() {
+        "ext4" => Command::new("mkfs.ext4")
+            .args(&["-F", &nbd_device])
+            .output(),
+        "xfs" => Command::new("mkfs.xfs")
+            .args(&["-f", &nbd_device])
+            .output(),
+        "zfs" => {
+            anyhow::bail!("ZFS requires manual setup. Use 'zpool create' with the NBD device.");
+        }
+        _ => anyhow::bail!("Unsupported filesystem: {}. Use ext4 or xfs.", filesystem),
+    };
+
+    let format_output = format_result.context(format!(
+        "Failed to format device. Is mkfs.{} installed?",
+        filesystem
+    ))?;
+
+    if !format_output.status.success() {
+        // Cleanup: disconnect NBD
+        let _ = Command::new("nbd-client").args(&["-d", &nbd_device]).output();
+        anyhow::bail!(
+            "Failed to format device:\n{}",
+            String::from_utf8_lossy(&format_output.stderr)
+        );
+    }
+    println!("✓ Device formatted as {}", filesystem);
+    println!();
+
+    // Step 4: Create mount point
+    println!("📁 Step 4/6: Creating mount point {}...", mount_point.display());
+    std::fs::create_dir_all(&mount_point).context("Failed to create mount point")?;
+    println!("✓ Mount point created");
+    println!();
+
+    // Step 5: Mount the filesystem
+    println!("🔗 Step 5/6: Mounting {} to {}...", nbd_device, mount_point.display());
+    let mount_output = Command::new("mount")
+        .args(&[&nbd_device, mount_point.to_str().unwrap()])
+        .output()
+        .context("Failed to mount device")?;
+
+    if !mount_output.status.success() {
+        // Cleanup: disconnect NBD
+        let _ = Command::new("nbd-client").args(&["-d", &nbd_device]).output();
+        anyhow::bail!(
+            "Failed to mount device:\n{}",
+            String::from_utf8_lossy(&mount_output.stderr)
+        );
+    }
+    println!("✓ Filesystem mounted");
+    println!();
+
+    // Step 6: Export via NFS
+    println!("🌐 Step 6/6: Configuring NFS export...");
+    let export_path = nfs_export.unwrap_or_else(|| mount_point.to_str().unwrap().to_string());
+    let export_line = format!("{} *({})\n", export_path, nfs_options);
+
+    // Check if already exported
+    let exports_content = std::fs::read_to_string("/etc/exports")
+        .unwrap_or_default();
+    
+    if !exports_content.contains(&export_path) {
+        // Append to /etc/exports
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open("/etc/exports")
+            .context("Failed to open /etc/exports. Run with sudo?")?
+            .write_all(export_line.as_bytes())
+            .context("Failed to write to /etc/exports")?;
+
+        // Reload NFS exports
+        let exportfs_output = Command::new("exportfs")
+            .args(&["-ra"])
+            .output()
+            .context("Failed to reload NFS exports. Is nfs-kernel-server installed?")?;
+
+        if !exportfs_output.status.success() {
+            eprintln!("⚠ Warning: Failed to reload NFS exports:\n{}",
+                String::from_utf8_lossy(&exportfs_output.stderr));
+        } else {
+            println!("✓ NFS export configured");
+        }
+    } else {
+        println!("✓ NFS export already configured");
+    }
+
+    println!();
+    println!("✅ Export complete!\n");
+    println!("📊 Summary:");
+    println!("  NBD Device: {}", nbd_device);
+    println!("  Filesystem: {}", filesystem);
+    println!("  Mount Point: {}", mount_point.display());
+    println!("  NFS Export: {}", export_path);
+    println!("  NFS Options: {}", nfs_options);
+    println!();
+    println!("🖥️  Clients can now mount with:");
+    println!("  sudo mount -t nfs <server-ip>:{} /mnt/remote", export_path);
+    println!();
+    println!("📝 To make persistent, add to /etc/fstab on this server:");
+    println!("  {} {} {} defaults 0 0", nbd_device, mount_point.display(), filesystem);
+    println!();
+    println!("⚠️  Important: Ensure ZeroFS server is running before system boot!");
+
+    Ok(())
 }
 
 #[cfg(test)]
