@@ -97,6 +97,20 @@ async fn main() -> Result<()> {
                 cli::checkpoint::get_checkpoint_info(&config, &name).await?;
             }
         },
+        cli::Commands::Nbd { subcommand } => match subcommand {
+            cli::NbdCommands::Create { config, name, size } => {
+                cli::nbd::create_device(config, name, size).await?;
+            }
+            cli::NbdCommands::List { config } => {
+                cli::nbd::list_devices(config).await?;
+            }
+            cli::NbdCommands::Delete { config, name, force } => {
+                cli::nbd::delete_device(config, name, force).await?;
+            }
+            cli::NbdCommands::Resize { config, name, size } => {
+                cli::nbd::resize_device(config, name, size).await?;
+            }
+        },
     }
 
     Ok(())

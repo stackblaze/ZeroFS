@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub mod checkpoint;
 pub mod debug;
+pub mod nbd;
 pub mod password;
 pub mod server;
 
@@ -53,6 +54,11 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: CheckpointCommands,
     },
+    /// NBD device management commands
+    Nbd {
+        #[command(subcommand)]
+        subcommand: NbdCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -91,6 +97,43 @@ pub enum CheckpointCommands {
         config: PathBuf,
         /// Checkpoint name to query
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum NbdCommands {
+    /// Create a new NBD device
+    Create {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name (will be accessible as .nbd/<name>)
+        name: String,
+        /// Device size (e.g., 10G, 512M, 1T)
+        size: String,
+    },
+    /// List all NBD devices
+    List {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Delete an NBD device
+    Delete {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name to delete
+        name: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Resize an NBD device
+    Resize {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name to resize
+        name: String,
+        /// New size (e.g., 10G, 512M, 1T)
+        size: String,
     },
 }
 
