@@ -190,8 +190,6 @@ pub async fn export_device(
     nbd_device: String,
     filesystem: String,
     mount_point: PathBuf,
-    nfs_export: Option<String>,
-    nfs_options: String,
     nbd_host: String,
     nbd_port: u16,
 ) -> Result<()> {
@@ -305,40 +303,8 @@ pub async fn export_device(
     }
     println!();
 
-    // Step 5: Export via NFS
-    println!("🌐 Step 5/5: Configuring NFS export...");
-    let export_path = nfs_export.unwrap_or_else(|| mount_point.to_str().unwrap().to_string());
-    let export_line = format!("{} *({})\n", export_path, nfs_options);
-
-    // Check if already exported
-    let exports_content = std::fs::read_to_string("/etc/exports")
-        .unwrap_or_default();
-    
-    if !exports_content.contains(&export_path) {
-        // Append to /etc/exports
-        std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open("/etc/exports")
-            .context("Failed to open /etc/exports. Run with sudo?")?
-            .write_all(export_line.as_bytes())
-            .context("Failed to write to /etc/exports")?;
-
-        // Reload NFS exports
-        let exportfs_output = Command::new("exportfs")
-            .args(&["-ra"])
-            .output()
-            .context("Failed to reload NFS exports. Is nfs-kernel-server installed?")?;
-
-        if !exportfs_output.status.success() {
-            eprintln!("⚠ Warning: Failed to reload NFS exports:\n{}",
-                String::from_utf8_lossy(&exportfs_output.stderr));
-        } else {
-            println!("✓ NFS export configured");
-        }
-    } else {
-        println!("✓ NFS export already configured");
-    }
+    // Step 5: Done
+    println!("✅ Step 5/5: Mount complete!");
 
     println!();
     println!("✅ Export complete!\n");
@@ -350,11 +316,18 @@ pub async fn export_device(
         println!("  Subvolumes: @, @home, @snapshots");
     }
     println!("  Mount Point: {}", mount_point.display());
-    println!("  NFS Export: {}", export_path);
-    println!("  NFS Options: {}", nfs_options);
     println!();
-    println!("🖥️  Clients can now mount with:");
-    println!("  sudo mount -t nfs <server-ip>:{} /mnt/remote", export_path);
+    println!("🌐 Remote Access via ZeroFS NFS:");
+    println!("  Clients can access NBD devices through ZeroFS's built-in NFS server:");
+    println!();
+    println!("  1️⃣  Mount ZeroFS via NFS:");
+    println!("     sudo mount -t nfs <zerofs-host>:/ /mnt/zerofs");
+    println!();
+    println!("  2️⃣  Connect to NBD device:");
+    println!("     sudo nbd-client <zerofs-host> <nbd-port> /dev/nbd0 -N {}", name);
+    println!();
+    println!("  3️⃣  Mount the formatted filesystem:");
+    println!("     sudo mount /dev/nbd0 /mnt/storage");
     println!();
     
     if filesystem == "btrfs" {

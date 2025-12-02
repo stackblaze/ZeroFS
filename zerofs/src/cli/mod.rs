@@ -152,12 +152,6 @@ pub enum NbdCommands {
         /// Mount point for the filesystem
         #[arg(long)]
         mount_point: PathBuf,
-        /// NFS export path (defaults to mount point)
-        #[arg(long)]
-        nfs_export: Option<String>,
-        /// NFS export options
-        #[arg(long, default_value = "rw,sync,no_subtree_check")]
-        nfs_options: String,
         /// ZeroFS server address for NBD connection
         #[arg(long, default_value = "127.0.0.1")]
         nbd_host: String,

@@ -118,8 +118,6 @@ async fn main() -> Result<()> {
                 nbd_device,
                 filesystem,
                 mount_point,
-                nfs_export,
-                nfs_options,
                 nbd_host,
                 nbd_port,
             } => {
@@ -130,8 +128,6 @@ async fn main() -> Result<()> {
                     nbd_device,
                     filesystem,
                     mount_point,
-                    nfs_export,
-                    nfs_options,
                     nbd_host,
                     nbd_port,
                 )
