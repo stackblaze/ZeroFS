@@ -1,0 +1,21 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the pre-built binary
+COPY zerofs/target/release/zerofs /usr/local/bin/zerofs
+
+RUN chmod +x /usr/local/bin/zerofs && \
+    useradd -m -u 1001 zerofs
+
+USER zerofs
+
+# Default ports that might be used - actual configuration comes from TOML file
+# 2049: NFS, 5564: 9P, 10809: NBD
+EXPOSE 2049 5564 10809
+
+ENTRYPOINT ["zerofs"]
+

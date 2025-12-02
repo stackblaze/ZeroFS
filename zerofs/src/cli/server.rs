@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 const CHECKPOINT_REFRESH_INTERVAL_SECS: u64 = 10;
 
@@ -620,6 +620,21 @@ pub async fn run_server(
         start_ninep_servers(Arc::clone(&fs), settings.servers.ninep.as_ref()).await?;
 
     let nbd_handles = start_nbd_servers(Arc::clone(&fs), settings.servers.nbd.as_ref()).await;
+
+    // Start control server for CLI communication
+    let control_handle = if !db_mode.is_read_only() {
+        let control_socket = settings.cache.dir.join("zerofs.sock");
+        let control_socket_str = control_socket.to_str().unwrap().to_string();
+        info!("Starting control server on {}", control_socket_str);
+        let control_server = crate::control::ControlServer::new(Arc::clone(&fs), control_socket_str);
+        Some(tokio::spawn(async move {
+            if let Err(e) = control_server.run().await {
+                error!("Control server error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
 
     let checkpoint_manager = Arc::new(CheckpointManager::new(
         init_result.db_handle,
