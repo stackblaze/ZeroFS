@@ -146,8 +146,8 @@ pub enum NbdCommands {
         /// NBD device to use (e.g., /dev/nbd0)
         #[arg(long, default_value = "/dev/nbd0")]
         nbd_device: String,
-        /// Filesystem type (ext4, xfs, zfs)
-        #[arg(long, default_value = "ext4")]
+        /// Filesystem type (btrfs, ext4, xfs, zfs)
+        #[arg(long, default_value = "btrfs")]
         filesystem: String,
         /// Mount point for the filesystem
         #[arg(long)]

@@ -392,6 +392,9 @@ pub async fn export_device(
     // Step 3: Format the device
     println!("💾 Step 3/6: Formatting {} as {}...", nbd_device, filesystem);
     let format_result = match filesystem.as_str() {
+        "btrfs" => Command::new("mkfs.btrfs")
+            .args(&["-f", &nbd_device])
+            .output(),
         "ext4" => Command::new("mkfs.ext4")
             .args(&["-F", &nbd_device])
             .output(),
@@ -401,7 +404,7 @@ pub async fn export_device(
         "zfs" => {
             anyhow::bail!("ZFS requires manual setup. Use 'zpool create' with the NBD device.");
         }
-        _ => anyhow::bail!("Unsupported filesystem: {}. Use ext4 or xfs.", filesystem),
+        _ => anyhow::bail!("Unsupported filesystem: {}. Use btrfs, ext4, or xfs.", filesystem),
     };
 
     let format_output = format_result.context(format!(
@@ -428,8 +431,16 @@ pub async fn export_device(
 
     // Step 5: Mount the filesystem
     println!("🔗 Step 5/6: Mounting {} to {}...", nbd_device, mount_point.display());
+    
+    // For btrfs, enable compression by default
+    let mount_args = if filesystem == "btrfs" {
+        vec!["-o", "compress=zstd", &nbd_device, mount_point.to_str().unwrap()]
+    } else {
+        vec![&nbd_device, mount_point.to_str().unwrap()]
+    };
+    
     let mount_output = Command::new("mount")
-        .args(&[&nbd_device, mount_point.to_str().unwrap()])
+        .args(&mount_args)
         .output()
         .context("Failed to mount device")?;
 
@@ -442,6 +453,19 @@ pub async fn export_device(
         );
     }
     println!("✓ Filesystem mounted");
+    
+    // For btrfs, create default subvolumes
+    if filesystem == "btrfs" {
+        println!("📂 Creating btrfs subvolumes...");
+        let subvols = vec!["@", "@home", "@snapshots"];
+        for subvol in &subvols {
+            let subvol_path = format!("{}/{}", mount_point.display(), subvol);
+            let _ = Command::new("btrfs")
+                .args(&["subvolume", "create", &subvol_path])
+                .output();
+        }
+        println!("✓ Created subvolumes: {}", subvols.join(", "));
+    }
     println!();
 
     // Step 6: Export via NFS
@@ -484,6 +508,10 @@ pub async fn export_device(
     println!("📊 Summary:");
     println!("  NBD Device: {}", nbd_device);
     println!("  Filesystem: {}", filesystem);
+    if filesystem == "btrfs" {
+        println!("  Compression: zstd (enabled)");
+        println!("  Subvolumes: @, @home, @snapshots");
+    }
     println!("  Mount Point: {}", mount_point.display());
     println!("  NFS Export: {}", export_path);
     println!("  NFS Options: {}", nfs_options);
@@ -491,8 +519,25 @@ pub async fn export_device(
     println!("🖥️  Clients can now mount with:");
     println!("  sudo mount -t nfs <server-ip>:{} /mnt/remote", export_path);
     println!();
+    
+    if filesystem == "btrfs" {
+        println!("📸 Btrfs Snapshot Commands:");
+        println!("  # Create snapshot");
+        println!("  sudo btrfs subvolume snapshot {} {}/snapshots/snap-$(date +%Y%m%d-%H%M)",
+            mount_point.display(), mount_point.display());
+        println!("  # List snapshots");
+        println!("  sudo btrfs subvolume list {}", mount_point.display());
+        println!("  # Delete snapshot");
+        println!("  sudo btrfs subvolume delete {}/snapshots/<snapshot-name>", mount_point.display());
+        println!();
+    }
+    
     println!("📝 To make persistent, add to /etc/fstab on this server:");
-    println!("  {} {} {} defaults 0 0", nbd_device, mount_point.display(), filesystem);
+    if filesystem == "btrfs" {
+        println!("  {} {} {} compress=zstd 0 0", nbd_device, mount_point.display(), filesystem);
+    } else {
+        println!("  {} {} {} defaults 0 0", nbd_device, mount_point.display(), filesystem);
+    }
     println!();
     println!("⚠️  Important: Ensure ZeroFS server is running before system boot!");
 
