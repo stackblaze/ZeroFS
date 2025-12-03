@@ -111,46 +111,6 @@ async fn main() -> Result<()> {
             cli::NbdCommands::Resize { config, name, size } => {
                 cli::nbd::resize_device(config, name, size).await?;
             }
-            cli::NbdCommands::Export {
-                config,
-                name,
-                size,
-                nbd_device,
-                filesystem,
-                mount_point,
-                nbd_host,
-                nbd_port,
-            } => {
-                cli::nbd::export_device(
-                    config,
-                    name,
-                    size,
-                    nbd_device,
-                    filesystem,
-                    mount_point,
-                    nbd_host,
-                    nbd_port,
-                )
-                .await?;
-            }
-            cli::NbdCommands::Snapshot {
-                mount_point,
-                name,
-                subvolume,
-                readonly,
-            } => {
-                cli::nbd::create_snapshot(mount_point, name, subvolume, readonly).await?;
-            }
-            cli::NbdCommands::ListSnapshots { mount_point } => {
-                cli::nbd::list_snapshots(mount_point).await?;
-            }
-            cli::NbdCommands::DeleteSnapshot {
-                mount_point,
-                name,
-                force,
-            } => {
-                cli::nbd::delete_snapshot(mount_point, name, force).await?;
-            }
         },
     }
 

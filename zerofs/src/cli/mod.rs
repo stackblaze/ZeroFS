@@ -135,62 +135,6 @@ pub enum NbdCommands {
         /// New size (e.g., 10G, 512M, 1T)
         size: String,
     },
-    /// Export NBD device as formatted filesystem via NFS
-    Export {
-        #[arg(short, long)]
-        config: PathBuf,
-        /// Device name to export
-        name: String,
-        /// Device size (e.g., 10G, 512M, 1T)
-        size: String,
-        /// NBD device to use (e.g., /dev/nbd0)
-        #[arg(long, default_value = "/dev/nbd0")]
-        nbd_device: String,
-        /// Filesystem type (btrfs, ext4, xfs, zfs)
-        #[arg(long, default_value = "btrfs")]
-        filesystem: String,
-        /// Mount point for the filesystem
-        #[arg(long)]
-        mount_point: PathBuf,
-        /// ZeroFS server address for NBD connection
-        #[arg(long, default_value = "127.0.0.1")]
-        nbd_host: String,
-        /// ZeroFS NBD port
-        #[arg(long, default_value = "10809")]
-        nbd_port: u16,
-    },
-    /// Create a btrfs snapshot
-    Snapshot {
-        /// Mount point of the btrfs filesystem
-        #[arg(long)]
-        mount_point: PathBuf,
-        /// Snapshot name (optional, defaults to timestamp)
-        #[arg(long)]
-        name: Option<String>,
-        /// Source subvolume to snapshot (default: @)
-        #[arg(long, default_value = "@")]
-        subvolume: String,
-        /// Create read-only snapshot
-        #[arg(long)]
-        readonly: bool,
-    },
-    /// List btrfs snapshots
-    ListSnapshots {
-        /// Mount point of the btrfs filesystem
-        #[arg(long)]
-        mount_point: PathBuf,
-    },
-    /// Delete a btrfs snapshot
-    DeleteSnapshot {
-        /// Mount point of the btrfs filesystem
-        #[arg(long)]
-        mount_point: PathBuf,
-        /// Snapshot name to delete
-        name: String,
-        /// Skip confirmation prompt
-        #[arg(short, long)]
-        force: bool,
-    },
 }
 
 impl Cli {
