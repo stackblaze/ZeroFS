@@ -222,7 +222,7 @@ impl EncryptedDb {
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
         let read_options = ReadOptions {
             durability_filter: DurabilityLevel::Memory,
-            dirty: true,
+            ..Default::default()
         };
 
         let encrypted = match &self.inner {

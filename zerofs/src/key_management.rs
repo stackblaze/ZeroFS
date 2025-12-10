@@ -167,7 +167,7 @@ pub async fn load_or_init_encryption_key(
     // Check if wrapped key exists in database
     let read_options = ReadOptions {
         durability_filter: DurabilityLevel::Memory,
-        dirty: true,
+        ..Default::default()
     };
     let existing_key = match db_handle {
         SlateDbHandle::ReadWrite(db) => {
@@ -248,7 +248,7 @@ pub async fn change_encryption_password(
 
     let read_options = ReadOptions {
         durability_filter: DurabilityLevel::Memory,
-        dirty: true,
+        ..Default::default()
     };
     let data = match db_handle {
         SlateDbHandle::ReadWrite(db) => {

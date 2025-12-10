@@ -707,7 +707,7 @@ pub async fn run_server(
     .await;
 
     // Start control server for CLI communication
-    let control_handle = if !db_mode.is_read_only() {
+    let _control_handle = if !db_mode.is_read_only() {
         let control_socket = settings.cache.dir.join("zerofs.sock");
         let control_socket_str = control_socket.to_str().unwrap().to_string();
         info!("Starting control server on {}", control_socket_str);
