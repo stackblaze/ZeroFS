@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package zerofs.admin;
+
+import "google/protobuf/timestamp.proto";
+
+service AdminService {
+    rpc CreateCheckpoint(CreateCheckpointRequest) returns (CreateCheckpointResponse);
+
+    rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+
+    rpc DeleteCheckpoint(DeleteCheckpointRequest) returns (DeleteCheckpointResponse);
+
+    rpc GetCheckpointInfo(GetCheckpointInfoRequest) returns (GetCheckpointInfoResponse);
+
+    rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
+}
+
+message CheckpointInfo {
+    // UUID as string
+    string id = 1;
+    string name = 2;
+    google.protobuf.Timestamp created_at = 3;
+}
+
+message CreateCheckpointRequest {
+    string name = 1;
+}
+
+message CreateCheckpointResponse {
+    CheckpointInfo checkpoint = 1;
+}
+
+message ListCheckpointsRequest {}
+
+message ListCheckpointsResponse {
+    repeated CheckpointInfo checkpoints = 1;
+}
+
+message DeleteCheckpointRequest {
+    string name = 1;
+}
+
+message DeleteCheckpointResponse {}
+
+message GetCheckpointInfoRequest {
+    string name = 1;
+}
+
+message GetCheckpointInfoResponse {
+    CheckpointInfo checkpoint = 1;
+}
+
+message WatchFileAccessRequest {}
+
+message FileAccessEvent {
+    google.protobuf.Timestamp timestamp = 1;
+    FileOperation operation = 2;
+    string path = 3;
+    OperationParams params = 4;
+}
+
+enum FileOperation {
+    READ = 0;
+    WRITE = 1;
+    CREATE = 2;
+    REMOVE = 3;
+    RENAME = 4;
+    MKDIR = 5;
+    READDIR = 6;
+    LOOKUP = 7;
+    SETATTR = 8;
+    LINK = 9;
+    SYMLINK = 10;
+    MKNOD = 11;
+    TRIM = 12;
+}
+
+message OperationParams {
+    optional uint64 offset = 1;
+    optional uint64 length = 2;
+    optional uint32 mode = 3;
+    optional string new_path = 4;
+    optional string link_target = 5;
+    optional string filename = 6;
+}

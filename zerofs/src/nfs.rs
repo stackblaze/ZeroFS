@@ -5,6 +5,7 @@ use crate::fs::types::{FileType, InodeWithId, SetAttributes};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{ftype3, *};
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -54,7 +55,7 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn getattr(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
         debug!("getattr called: id={}", id);
-        let inode = self.fs.get_inode_cached(id).await?;
+        let inode = self.fs.inode_store.get(id).await?;
         Ok(InodeWithId { inode: &inode, id }.into())
     }
 
@@ -270,7 +271,7 @@ impl NFSFileSystem for NFSAdapter {
     async fn readlink(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<nfspath3, nfsstat3> {
         debug!("readlink called: id={}", id);
 
-        let inode = self.fs.get_inode_cached(id).await?;
+        let inode = self.fs.inode_store.get(id).await?;
 
         match inode {
             Inode::Symlink(symlink) => Ok(nfspath3 { 0: symlink.target }),
@@ -359,7 +360,10 @@ impl NFSFileSystem for NFSAdapter {
 
         let obj_attr = match self.getattr(auth, fileid).await {
             Ok(v) => post_op_attr::attributes(v),
-            Err(_) => post_op_attr::Void,
+            Err(e) => {
+                debug!("fsstat: getattr failed for fileid {}: {:?}", fileid, e);
+                post_op_attr::Void
+            }
         };
 
         let (used_bytes, used_inodes) = self.fs.global_stats.get_totals();
@@ -368,14 +372,17 @@ impl NFSFileSystem for NFSAdapter {
         let available_inodes = u64::MAX.saturating_sub(next_inode_id);
         let total_inodes = used_inodes + available_inodes;
 
-        // Use configured max_bytes from filesystem config
-        let total_bytes = self.fs.max_bytes;
+        // Use configured max_bytes from filesystem config, capped at 8 EiB
+        // to avoid breaking NFS clients that can't handle larger values
+        const MAX_NFS_BYTES: u64 = 8 * (1 << 60); // 8 EiB
+        let total_bytes = self.fs.max_bytes.min(MAX_NFS_BYTES);
+        let free_bytes = total_bytes.saturating_sub(used_bytes);
 
         let res = fsstat3 {
             obj_attributes: obj_attr,
             tbytes: total_bytes,
-            fbytes: total_bytes.saturating_sub(used_bytes),
-            abytes: total_bytes.saturating_sub(used_bytes),
+            fbytes: free_bytes,
+            abytes: free_bytes,
             tfiles: total_inodes,
             ffiles: available_inodes,
             afiles: available_inodes,
@@ -389,13 +396,14 @@ impl NFSFileSystem for NFSAdapter {
 pub async fn start_nfs_server_with_config(
     filesystem: Arc<ZeroFS>,
     socket: SocketAddr,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let adapter = NFSAdapter::new(filesystem);
     let listener = NFSTcpListener::bind(socket, adapter).await?;
 
     info!("NFS server listening on {}", socket);
 
-    listener.handle_forever().await?;
+    listener.handle_with_shutdown(shutdown).await?;
     Ok(())
 }
 

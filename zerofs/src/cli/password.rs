@@ -60,12 +60,12 @@ pub async fn change_password(
     let actual_db_path = path_from_url.to_string();
 
     let cache_config = CacheConfig {
-        root_folder: settings.cache.dir.to_str().unwrap().to_string(),
+        root_folder: settings.cache.dir.clone(),
         max_cache_size_gb: settings.cache.disk_size_gb,
         memory_cache_size_gb: settings.cache.memory_size_gb,
     };
 
-    let (slatedb, _) = build_slatedb(
+    let (slatedb, _, _) = build_slatedb(
         object_store,
         &cache_config,
         actual_db_path,

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub mod checkpoint;
 pub mod debug;
+pub mod fatrace;
 pub mod nbd;
 pub mod password;
 pub mod server;
@@ -58,6 +59,11 @@ pub enum Commands {
     Nbd {
         #[command(subcommand)]
         subcommand: NbdCommands,
+    },
+    /// Trace file system operations in real-time
+    Fatrace {
+        #[arg(short, long)]
+        config: PathBuf,
     },
 }
 

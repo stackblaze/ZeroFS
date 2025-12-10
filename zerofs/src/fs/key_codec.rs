@@ -2,14 +2,32 @@ use super::errors::FsError;
 use super::inode::InodeId;
 use bytes::Bytes;
 
+// Key prefix design for LSM tree optimization with size-tiered compaction.
+//
+// Prefixes are ordered to optimize S3 request patterns during scans. Since SlateDB
+// stores each SST as a separate S3 object, keys that are scanned together should be
+// adjacent in keyspace to minimize the number of SSTs (and thus S3 GETs) touched.
+//
+// Layout:
+//   0x01-0x05: Hot metadata (frequently accessed together)
+//     - INODE + DIR_ENTRY are adjacent for lookup() operations
+//     - DIR_ENTRY + DIR_SCAN + DIR_COOKIE are adjacent for directory operations
+//     - STATS
+//   0x06-0x07: Cold metadata
+//     - SYSTEM: rarely accessed configuration
+//     - TOMBSTONE: only scanned during background GC
+//   0xFE: Bulk data
+//     - CHUNK: large data that dominates storage; isolated to prevent metadata
+//       scans from touching chunk-heavy SSTs
+
 const PREFIX_INODE: u8 = 0x01;
-const PREFIX_CHUNK: u8 = 0x02;
-const PREFIX_DIR_ENTRY: u8 = 0x03;
-const PREFIX_DIR_SCAN: u8 = 0x04;
-const PREFIX_TOMBSTONE: u8 = 0x05;
-const PREFIX_STATS: u8 = 0x06;
-const PREFIX_SYSTEM: u8 = 0x07;
-const PREFIX_DIR_COOKIE: u8 = 0x08;
+const PREFIX_DIR_ENTRY: u8 = 0x02;
+const PREFIX_DIR_SCAN: u8 = 0x03;
+const PREFIX_DIR_COOKIE: u8 = 0x04;
+const PREFIX_STATS: u8 = 0x05;
+const PREFIX_SYSTEM: u8 = 0x06;
+const PREFIX_TOMBSTONE: u8 = 0x07;
+const PREFIX_CHUNK: u8 = 0xFE;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 
@@ -103,6 +121,14 @@ impl KeyCodec {
         key.extend_from_slice(&inode_id.to_be_bytes());
         key.extend_from_slice(&chunk_index.to_be_bytes());
         Bytes::from(key)
+    }
+
+    pub fn parse_chunk_key(key: &[u8]) -> Option<u64> {
+        if key.len() != KEY_CHUNK_SIZE || key[0] != PREFIX_CHUNK {
+            return None;
+        }
+        let chunk_bytes: [u8; U64_SIZE] = key[KEY_INODE_SIZE..KEY_CHUNK_SIZE].try_into().ok()?;
+        Some(u64::from_be_bytes(chunk_bytes))
     }
 
     pub fn dir_entry_key(dir_id: InodeId, name: &[u8]) -> Bytes {

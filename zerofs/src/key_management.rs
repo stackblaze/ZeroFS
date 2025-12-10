@@ -1,5 +1,6 @@
 use crate::encryption::SlateDbHandle;
 use crate::fs::key_codec::SYSTEM_WRAPPED_ENCRYPTION_KEY;
+use crate::task::spawn_blocking_named;
 use anyhow::Result;
 use argon2::{
     Algorithm, Argon2, Params, Version,
@@ -21,7 +22,7 @@ const ARGON2_PARALLELISM: u32 = 4;
 pub struct WrappedDataKey {
     /// Salt for Argon2 password derivation
     pub salt: String,
-    /// Nonce for ChaCha20-Poly1305 encryption of the DEK
+    /// Nonce for XChaCha20-Poly1305 encryption of the DEK
     pub nonce: [u8; 12],
     /// Encrypted data encryption key
     pub wrapped_dek: Vec<u8>,
@@ -187,7 +188,12 @@ pub async fn load_or_init_encryption_key(
             let wrapped_key: WrappedDataKey = bincode::deserialize(&data)
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize wrapped key: {}", e))?;
 
-            key_manager.unwrap_key(password, &wrapped_key)
+            let password = password.to_string();
+            spawn_blocking_named("argon2-unwrap", move || {
+                key_manager.unwrap_key(&password, &wrapped_key)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
         }
         None => {
             // First time setup - generate new key
@@ -197,7 +203,12 @@ pub async fn load_or_init_encryption_key(
                 ));
             }
 
-            let (wrapped_key, dek) = key_manager.generate_and_wrap_key(password)?;
+            let password = password.to_string();
+            let (wrapped_key, dek) = spawn_blocking_named("argon2-generate", move || {
+                key_manager.generate_and_wrap_key(&password)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
             // Store wrapped key in database
             let serialized = bincode::serialize(&wrapped_key)
@@ -256,10 +267,14 @@ pub async fn change_encryption_password(
     let wrapped_key: WrappedDataKey = bincode::deserialize(&data)
         .map_err(|e| anyhow::anyhow!("Failed to deserialize wrapped key: {}", e))?;
 
-    // Re-wrap with new password
-    let new_wrapped_key = key_manager.rewrap_key(old_password, new_password, &wrapped_key)?;
+    let old_password = old_password.to_string();
+    let new_password = new_password.to_string();
+    let new_wrapped_key = spawn_blocking_named("argon2-rewrap", move || {
+        key_manager.rewrap_key(&old_password, &new_password, &wrapped_key)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
-    // Store updated wrapped key
     let serialized = bincode::serialize(&new_wrapped_key)
         .map_err(|e| anyhow::anyhow!("Failed to serialize wrapped key: {}", e))?;
 

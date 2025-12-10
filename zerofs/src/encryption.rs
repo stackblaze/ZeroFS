@@ -1,5 +1,6 @@
 use crate::fs::errors::FsError;
 use crate::fs::key_codec::KeyPrefix;
+use crate::task::spawn_blocking_named;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -21,6 +22,15 @@ use std::sync::Arc;
 
 const NONCE_SIZE: usize = 24;
 
+/// Fatal handler for SlateDB write errors.
+/// After a write failure, the database state is unknown - exit and let
+/// the eventual orchestrator restart the service to rebuild from a known-good state.
+pub fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
+    tracing::error!("Fatal write error, exiting: {}", err);
+    std::process::exit(1)
+}
+
+#[derive(Clone)]
 pub struct EncryptionManager {
     cipher: XChaCha20Poly1305,
 }
@@ -128,15 +138,19 @@ impl EncryptedTransaction {
             let operations = self.pending_operations;
             let encryptor = self.encryptor.clone();
 
-            let encrypted_operations: Result<Vec<_>, _> = operations
-                .into_iter()
-                .map(|(key, value)| {
-                    let encrypted = encryptor.encrypt(&key, &value)?;
-                    Ok::<(Bytes, Vec<u8>), anyhow::Error>((key, encrypted))
-                })
-                .collect();
+            let encrypted_operations = spawn_blocking_named("encrypt-batch", move || {
+                operations
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let encrypted = encryptor.encrypt(&key, &value)?;
+                        Ok::<(Bytes, Vec<u8>), anyhow::Error>((key, encrypted))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
-            for (key, encrypted) in encrypted_operations? {
+            for (key, encrypted) in encrypted_operations {
                 inner.put(&key, &encrypted);
             }
         }
@@ -221,7 +235,12 @@ impl EncryptedDb {
 
         match encrypted {
             Some(encrypted) => {
-                let decrypted = self.encryptor.decrypt(key, &encrypted)?;
+                let encryptor = self.encryptor.clone();
+                let key = key.clone();
+                let decrypted =
+                    spawn_blocking_named("decrypt", move || encryptor.decrypt(&key, &encrypted))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
                 Ok(Some(bytes::Bytes::from(decrypted)))
             }
             None => Ok(None),
@@ -235,9 +254,8 @@ impl EncryptedDb {
         let encryptor = self.encryptor.clone();
         let scan_options = ScanOptions {
             durability_filter: DurabilityLevel::Memory,
-            dirty: true,
-            read_ahead_bytes: 8 * 1024 * 1024, // 8MB read-ahead
-            max_fetch_tasks: 8,
+            read_ahead_bytes: 1024 * 1024,
+            max_fetch_tasks: 4,
             ..Default::default()
         };
         let iter = match &self.inner {
@@ -298,7 +316,11 @@ impl EncryptedDb {
         let (inner_batch, _cache_ops) = txn.into_inner().await?;
 
         match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.write_with_options(inner_batch, options).await?,
+            SlateDbHandle::ReadWrite(db) => {
+                if let Err(e) = db.write_with_options(inner_batch, options).await {
+                    exit_on_write_error(e);
+                }
+            }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
 
@@ -314,7 +336,11 @@ impl EncryptedDb {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
         match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.write_with_options(batch, options).await?,
+            SlateDbHandle::ReadWrite(db) => {
+                if let Err(e) = db.write_with_options(batch, options).await {
+                    exit_on_write_error(e);
+                }
+            }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
         Ok(())
@@ -338,11 +364,22 @@ impl EncryptedDb {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
-        let encrypted = self.encryptor.encrypt(key, value)?;
+        let encryptor = self.encryptor.clone();
+        let key_clone = key.clone();
+        let value = value.to_vec();
+        let encrypted =
+            spawn_blocking_named("encrypt", move || encryptor.encrypt(&key_clone, &value))
+                .await
+                .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
+
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
-                db.put_with_options(key, &encrypted, put_options, write_options)
-                    .await?
+                if let Err(e) = db
+                    .put_with_options(key, &encrypted, put_options, write_options)
+                    .await
+                {
+                    exit_on_write_error(e);
+                }
             }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
@@ -355,7 +392,11 @@ impl EncryptedDb {
         }
 
         match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.flush().await?,
+            SlateDbHandle::ReadWrite(db) => {
+                if let Err(e) = db.flush().await {
+                    exit_on_write_error(e);
+                }
+            }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
         Ok(())
@@ -363,7 +404,11 @@ impl EncryptedDb {
 
     pub async fn close(&self) -> Result<()> {
         match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.close().await?,
+            SlateDbHandle::ReadWrite(db) => {
+                if let Err(e) = db.close().await {
+                    exit_on_write_error(e);
+                }
+            }
             SlateDbHandle::ReadOnly(reader_swap) => {
                 let reader = reader_swap.load();
                 reader.close().await?

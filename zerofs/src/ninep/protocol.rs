@@ -1,3 +1,4 @@
+use crate::deku_bytes::DekuBytes;
 use deku::prelude::*;
 
 pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
@@ -32,7 +33,9 @@ pub enum LockType {
 
 pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
 
-// Server configuration constants
+/// Maximum message size we accept. Used for codec frame limit.
+pub const P9_MAX_MSIZE: u32 = 1024 * 1024;
+
 pub const P9_CHANNEL_SIZE: usize = 1000;
 pub const P9_SIZE_FIELD_LEN: usize = std::mem::size_of::<u32>();
 pub const P9_TYPE_FIELD_LEN: usize = std::mem::size_of::<u8>();
@@ -213,8 +216,8 @@ pub struct Twrite {
     pub offset: u64,
     #[deku(endian = "little")]
     pub count: u32,
-    #[deku(count = "count")]
-    pub data: Vec<u8>,
+    #[deku(ctx = "count")]
+    pub data: DekuBytes,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
@@ -470,8 +473,8 @@ pub struct Rlcreate {
 pub struct Rread {
     #[deku(endian = "little", update = "self.data.len()")]
     pub count: u32,
-    #[deku(count = "count")]
-    pub data: Vec<u8>,
+    #[deku(ctx = "count")]
+    pub data: DekuBytes,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
@@ -484,8 +487,8 @@ pub struct Rwrite {
 pub struct Rreaddir {
     #[deku(endian = "little", update = "self.data.len()")]
     pub count: u32,
-    #[deku(count = "count")]
-    pub data: Vec<u8>,
+    #[deku(ctx = "count")]
+    pub data: DekuBytes,
 }
 
 impl Rreaddir {
@@ -500,7 +503,7 @@ impl Rreaddir {
 
         Ok(Rreaddir {
             count: data.len() as u32,
-            data,
+            data: DekuBytes::from(data),
         })
     }
 
@@ -511,7 +514,7 @@ impl Rreaddir {
         let mut offset = 0;
 
         while offset < self.data.len() {
-            let remaining = &self.data[offset..];
+            let remaining = &self.data.0[offset..];
             let (_, entry) = DirEntry::from_bytes((remaining, 0))?;
 
             // Calculate how many bytes were consumed
@@ -795,9 +798,5 @@ impl P9Message {
             tag,
             body,
         }
-    }
-
-    pub fn error(tag: u16, ecode: u32) -> Self {
-        Self::new(tag, Message::Rlerror(Rlerror { ecode }))
     }
 }

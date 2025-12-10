@@ -3,11 +3,13 @@ use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::encryption::SlateDbHandle;
 use crate::fs::permissions::Credentials;
+use crate::fs::tracing::AccessTracer;
 use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::key_management;
 use crate::nbd::NBDServer;
 use crate::parse_object_store::parse_url_opts;
+use crate::task::spawn_named;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use slatedb::admin::AdminBuilder;
@@ -15,7 +17,7 @@ use slatedb::config::{
     CheckpointOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
     ObjectStoreCacheOptions,
 };
-use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::object_store::path::Path;
 use slatedb::{DbBuilder, DbReader};
 use std::path::PathBuf;
@@ -23,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 const CHECKPOINT_REFRESH_INTERVAL_SECS: u64 = 10;
@@ -64,6 +67,7 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
 async fn start_nfs_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NfsConfig>,
+    shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
         Some(c) => c,
@@ -75,8 +79,9 @@ async fn start_nfs_servers(
         info!("Starting NFS server on {}", addr);
         let fs_clone = Arc::clone(&fs);
         let addr = *addr;
-        handles.push(tokio::spawn(async move {
-            match crate::nfs::start_nfs_server_with_config(fs_clone, addr).await {
+        let shutdown_clone = shutdown.clone();
+        handles.push(spawn_named("nfs-server", async move {
+            match crate::nfs::start_nfs_server_with_config(fs_clone, addr, shutdown_clone).await {
                 Ok(()) => Ok(()),
                 Err(e) => Err(std::io::Error::other(e.to_string())),
             }
@@ -89,6 +94,7 @@ async fn start_nfs_servers(
 async fn start_ninep_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NinePConfig>,
+    shutdown: CancellationToken,
 ) -> Result<Vec<JoinHandle<Result<(), std::io::Error>>>> {
     let config = match config {
         Some(c) => c,
@@ -100,7 +106,10 @@ async fn start_ninep_servers(
         for addr in addresses {
             info!("Starting 9P server on {}", addr);
             let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
-            handles.push(tokio::spawn(async move { ninep_tcp_server.start().await }));
+            let shutdown_clone = shutdown.clone();
+            handles.push(spawn_named("9p-server", async move {
+                ninep_tcp_server.start(shutdown_clone).await
+            }));
         }
     }
 
@@ -112,7 +121,10 @@ async fn start_ninep_servers(
         let ninep_unix_fs = Arc::clone(&fs);
         let ninep_unix_server =
             crate::ninep::NinePServer::new_unix(ninep_unix_fs, socket_path.clone());
-        handles.push(tokio::spawn(async move { ninep_unix_server.start().await }));
+        let shutdown_clone = shutdown.clone();
+        handles.push(spawn_named("9p-unix-server", async move {
+            ninep_unix_server.start(shutdown_clone).await
+        }));
     }
 
     Ok(handles)
@@ -129,7 +141,8 @@ async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
 
     match fs.lookup(&creds, 0, nbd_name).await {
         Ok(_) => info!(".nbd directory already exists"),
-        Err(_) => {
+        Err(e) => {
+            debug!(".nbd directory lookup returned: {:?}, will create it", e);
             let attr = SetAttributes {
                 mode: crate::fs::types::SetMode::Set(0o755),
                 uid: crate::fs::types::SetUid::Set(0),
@@ -148,6 +161,7 @@ async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
 async fn start_nbd_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NbdConfig>,
+    shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
         Some(c) => c,
@@ -162,8 +176,9 @@ async fn start_nbd_servers(
                 addr
             );
             let nbd_tcp_server = NBDServer::new_tcp(Arc::clone(&fs), *addr);
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = nbd_tcp_server.start().await {
+            let shutdown_clone = shutdown.clone();
+            handles.push(spawn_named("nbd-server", async move {
+                if let Err(e) = nbd_tcp_server.start(shutdown_clone).await {
                     Err(e)
                 } else {
                     Ok(())
@@ -177,10 +192,10 @@ async fn start_nbd_servers(
             "Starting NBD server on Unix socket {} (devices dynamically discovered from .nbd/)",
             socket_path.display()
         );
-        let nbd_unix_server =
-            NBDServer::new_unix(Arc::clone(&fs), socket_path.to_str().unwrap().to_string());
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = nbd_unix_server.start().await {
+        let nbd_unix_server = NBDServer::new_unix(Arc::clone(&fs), socket_path);
+        let shutdown_clone = shutdown.clone();
+        handles.push(spawn_named("nbd-unix-server", async move {
+            if let Err(e) = nbd_unix_server.start(shutdown_clone).await {
                 Err(e)
             } else {
                 Ok(())
@@ -194,21 +209,24 @@ async fn start_nbd_servers(
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
+    tracer: AccessTracer,
+    shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
         Some(c) => c,
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::ZeroFsServiceImpl::new(checkpoint_manager);
+    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, tracer);
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
         for &addr in addresses {
             info!("Starting RPC server on {}", addr);
             let service = service.clone();
-            handles.push(tokio::spawn(async move {
-                crate::rpc::server::serve_tcp(addr, service)
+            let shutdown_clone = shutdown.clone();
+            handles.push(spawn_named("rpc-server", async move {
+                crate::rpc::server::serve_tcp(addr, service, shutdown_clone)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))
             }));
@@ -222,8 +240,9 @@ async fn start_rpc_servers(
         );
         let socket_path = socket_path.clone();
         let service = service.clone();
-        handles.push(tokio::spawn(async move {
-            crate::rpc::server::serve_unix(socket_path, service)
+        let shutdown_clone = shutdown.clone();
+        handles.push(spawn_named("rpc-unix-server", async move {
+            crate::rpc::server::serve_unix(socket_path, service, shutdown_clone)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))
         }));
@@ -232,28 +251,46 @@ async fn start_rpc_servers(
     handles
 }
 
-fn start_stats_reporting(fs: Arc<ZeroFS>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+fn start_stats_reporting(fs: Arc<ZeroFS>, shutdown: CancellationToken) -> JoinHandle<()> {
+    spawn_named("stats-reporting", async move {
         info!("Starting stats reporting task (reports to debug every 5 seconds)");
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
-            interval.tick().await;
-            fs.stats.output_report_debug();
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("Stats reporting task shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    fs.stats.output_report_debug();
+                }
+            }
         }
     })
 }
 
-fn start_periodic_flush(fs: Arc<ZeroFS>, interval_secs: u64) -> JoinHandle<()> {
-    tokio::spawn(async move {
+fn start_periodic_flush(
+    fs: Arc<ZeroFS>,
+    interval_secs: u64,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    spawn_named("periodic-flush", async move {
         info!(
             "Starting periodic flush task (flushes every {} seconds)",
             interval_secs
         );
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         loop {
-            interval.tick().await;
-            if let Err(e) = fs.flush_coordinator.flush().await {
-                tracing::error!("Periodic flush failed: {:?}", e);
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("Periodic flush task shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Err(e) = fs.flush_coordinator.flush().await {
+                        tracing::error!("Periodic flush failed: {:?}", e);
+                    }
+                }
             }
         }
     })
@@ -267,10 +304,11 @@ pub struct CheckpointRefreshParams {
 fn start_checkpoint_refresh(
     params: CheckpointRefreshParams,
     encrypted_db: Arc<crate::encryption::EncryptedDb>,
+    shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     let db_path = params.db_path;
     let object_store = params.object_store;
-    tokio::spawn(async move {
+    spawn_named("checkpoint-refresh", async move {
         info!("Starting checkpoint refresh task",);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
             CHECKPOINT_REFRESH_INTERVAL_SECS,
@@ -280,46 +318,52 @@ fn start_checkpoint_refresh(
         let admin = AdminBuilder::new(db_path.clone(), object_store.clone()).build();
 
         loop {
-            interval.tick().await;
-
-            match admin
-                .create_detached_checkpoint(&CheckpointOptions {
-                    lifetime: Some(std::time::Duration::from_secs(
-                        CHECKPOINT_REFRESH_INTERVAL_SECS * 10,
-                    )),
-                    ..Default::default()
-                })
-                .await
-            {
-                Ok(checkpoint_result) => {
-                    debug!("Created new checkpoint with ID: {}", checkpoint_result.id);
-
-                    match DbReader::open(
-                        db_path.clone(),
-                        object_store.clone(),
-                        Some(checkpoint_result.id),
-                        DbReaderOptions::default(),
-                    )
-                    .await
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("Checkpoint refresh task shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    match admin
+                        .create_detached_checkpoint(&CheckpointOptions {
+                            lifetime: Some(std::time::Duration::from_secs(
+                                CHECKPOINT_REFRESH_INTERVAL_SECS * 10,
+                            )),
+                            ..Default::default()
+                        })
+                        .await
                     {
-                        Ok(new_reader) => {
-                            if let Err(e) = encrypted_db.swap_reader(Arc::new(new_reader)) {
-                                tracing::error!("Failed to swap reader: {:?}", e);
-                                continue;
-                            }
+                        Ok(checkpoint_result) => {
+                            debug!("Created new checkpoint with ID: {}", checkpoint_result.id);
 
-                            debug!("Successfully refreshed reader");
+                            match DbReader::open(
+                                db_path.clone(),
+                                object_store.clone(),
+                                Some(checkpoint_result.id),
+                                DbReaderOptions::default(),
+                            )
+                            .await
+                            {
+                                Ok(new_reader) => {
+                                    if let Err(e) = encrypted_db.swap_reader(Arc::new(new_reader)) {
+                                        tracing::error!("Failed to swap reader: {:?}", e);
+                                        continue;
+                                    }
+
+                                    debug!("Successfully refreshed reader");
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to create new DbReader with checkpoint: {:?}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
-                            tracing::error!(
-                                "Failed to create new DbReader with checkpoint: {:?}",
-                                e
-                            );
+                            tracing::error!("Failed to create checkpoint: {:?}", e);
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to create checkpoint: {:?}", e);
                 }
             }
         }
@@ -332,7 +376,11 @@ pub async fn build_slatedb(
     db_path: String,
     db_mode: DatabaseMode,
     lsm_config: Option<crate::config::LsmConfig>,
-) -> Result<(SlateDbHandle, Option<CheckpointRefreshParams>)> {
+) -> Result<(
+    SlateDbHandle,
+    Option<CheckpointRefreshParams>,
+    Option<tokio::runtime::Handle>,
+)> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -365,10 +413,10 @@ pub async fn build_slatedb(
         wal_enabled: false,
         l0_max_ssts,
         l0_sst_size_bytes: 256 * 1024 * 1024,
+        filter_bits_per_key: 20,
         object_store_cache_options: ObjectStoreCacheOptions {
-            root_folder: Some(PathBuf::from(cache_config.root_folder.clone())),
+            root_folder: Some(cache_config.root_folder.clone()),
             max_cache_size_bytes: Some(slatedb_object_cache_bytes),
-            part_size_bytes: 16 * 1024 * 1024,
             cache_puts: false,
             ..Default::default()
         },
@@ -382,23 +430,25 @@ pub async fn build_slatedb(
         compression_codec: None, // Disable compression - we handle it in encryption layer
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_mins(10)),
-                min_age: Duration::from_mins(10),
+                interval: Some(Duration::from_mins(1)),
+                min_age: Duration::from_mins(1),
             }),
             manifest_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_mins(10)),
-                min_age: Duration::from_mins(10),
+                interval: Some(Duration::from_mins(1)),
+                min_age: Duration::from_mins(1),
             }),
             compacted_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_mins(10)),
-                min_age: Duration::from_mins(10),
+                interval: Some(Duration::from_mins(1)),
+                min_age: Duration::from_mins(1),
             }),
         }),
         ..Default::default()
     };
 
-    let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    let cache = Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
         max_capacity: slatedb_memory_cache_bytes,
+        time_to_live: None,
+        time_to_idle: None,
     }));
 
     let db_path = Path::from(db_path);
@@ -429,7 +479,11 @@ pub async fn build_slatedb(
                     .await?,
             );
 
-            Ok((SlateDbHandle::ReadWrite(slatedb), None))
+            Ok((
+                SlateDbHandle::ReadWrite(slatedb),
+                None,
+                Some(runtime_handle),
+            ))
         }
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
@@ -468,6 +522,7 @@ pub async fn build_slatedb(
             Ok((
                 SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
                 Some(checkpoint_params),
+                None,
             ))
         }
         DatabaseMode::Checkpoint(checkpoint_id) => {
@@ -483,7 +538,7 @@ pub async fn build_slatedb(
                 .await?,
             );
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
         }
     }
 }
@@ -494,13 +549,14 @@ pub struct InitResult {
     pub object_store: Arc<dyn object_store::ObjectStore>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
+    pub maintenance_runtime: Option<tokio::runtime::Handle>,
 }
 
 async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Result<InitResult> {
     let url = settings.storage.url.clone();
 
     let cache_config = CacheConfig {
-        root_folder: settings.cache.dir.to_str().unwrap().to_string(),
+        root_folder: settings.cache.dir.clone(),
         max_cache_size_gb: settings.cache.disk_size_gb,
         memory_cache_size_gb: settings.cache.memory_size_gb,
     };
@@ -514,23 +570,25 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
 
     info!("Starting ZeroFS server with {} backend", object_store);
     info!("DB Path: {}", actual_db_path);
-    info!("Base Cache Directory: {}", cache_config.root_folder);
+    info!(
+        "Base Cache Directory: {}",
+        cache_config.root_folder.display()
+    );
     info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
     info!("Checking bucket identity...");
     let bucket =
         bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path).await?;
 
-    let original_cache_root = cache_config.root_folder.clone();
     let cache_config = CacheConfig {
-        root_folder: format!("{}/{}", original_cache_root, bucket.cache_directory_name()),
+        root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
         ..cache_config
     };
 
     info!(
         "Bucket ID: {}, Cache directory: {}",
         bucket.id(),
-        cache_config.root_folder
+        cache_config.root_folder.display()
     );
 
     if !db_mode.is_read_only() {
@@ -545,7 +603,7 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
 
     info!("Loading or initializing encryption key");
 
-    let (slatedb, checkpoint_params) = build_slatedb(
+    let (slatedb, checkpoint_params, maintenance_runtime) = build_slatedb(
         object_store.clone(),
         &cache_config,
         actual_db_path.clone(),
@@ -556,14 +614,8 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
 
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
-    let max_bytes = settings
-        .filesystem
-        .as_ref()
-        .map(|fs_config| fs_config.max_bytes())
-        .unwrap_or(crate::config::FilesystemConfig::DEFAULT_MAX_BYTES);
-
     let db_handle = slatedb.clone();
-    let fs = ZeroFS::new_with_slatedb(slatedb, encryption_key, max_bytes).await?;
+    let fs = ZeroFS::new_with_slatedb(slatedb, encryption_key, settings.max_bytes()).await?;
 
     Ok(InitResult {
         fs: Arc::new(fs),
@@ -571,6 +623,7 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
         object_store,
         db_path: actual_db_path,
         db_handle,
+        maintenance_runtime,
     })
 }
 
@@ -582,12 +635,28 @@ pub async fn run_server(
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info"));
+
+    #[cfg(feature = "tokio-console")]
+    {
+        use tracing_subscriber::prelude::*;
+        let console_layer = console_subscriber::spawn();
+        tracing_subscriber::registry()
+            .with(console_layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_filter(filter),
+            )
+            .init();
+    }
+
+    #[cfg(not(feature = "tokio-console"))]
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
 
-    let settings = Settings::from_file(config_path.to_str().unwrap())
+    let settings = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     let db_mode = match (read_only, &checkpoint_name) {
@@ -614,12 +683,28 @@ pub async fn run_server(
         ensure_nbd_directory(&fs).await?;
     }
 
-    let nfs_handles = start_nfs_servers(Arc::clone(&fs), settings.servers.nfs.as_ref()).await;
+    let shutdown = CancellationToken::new();
 
-    let ninep_handles =
-        start_ninep_servers(Arc::clone(&fs), settings.servers.ninep.as_ref()).await?;
+    let nfs_handles = start_nfs_servers(
+        Arc::clone(&fs),
+        settings.servers.nfs.as_ref(),
+        shutdown.clone(),
+    )
+    .await;
 
-    let nbd_handles = start_nbd_servers(Arc::clone(&fs), settings.servers.nbd.as_ref()).await;
+    let ninep_handles = start_ninep_servers(
+        Arc::clone(&fs),
+        settings.servers.ninep.as_ref(),
+        shutdown.clone(),
+    )
+    .await?;
+
+    let nbd_handles = start_nbd_servers(
+        Arc::clone(&fs),
+        settings.servers.nbd.as_ref(),
+        shutdown.clone(),
+    )
+    .await;
 
     // Start control server for CLI communication
     let control_handle = if !db_mode.is_read_only() {
@@ -641,7 +726,13 @@ pub async fn run_server(
         slatedb::object_store::path::Path::from(init_result.db_path),
         init_result.object_store,
     ));
-    let rpc_handles = start_rpc_servers(settings.servers.rpc.as_ref(), checkpoint_manager).await;
+    let rpc_handles = start_rpc_servers(
+        settings.servers.rpc.as_ref(),
+        checkpoint_manager,
+        fs.tracer.clone(),
+        shutdown.clone(),
+    )
+    .await;
 
     let gc_handle = if !db_mode.is_read_only() {
         let gc = Arc::new(GarbageCollector::new(
@@ -650,23 +741,27 @@ pub async fn run_server(
             fs.chunk_store.clone(),
             Arc::clone(&fs.stats),
         ));
-        Some(gc.start())
+        Some(gc.start(shutdown.clone(), init_result.maintenance_runtime.clone()))
     } else {
         None
     };
-    let stats_handle = start_stats_reporting(Arc::clone(&fs));
+    let stats_handle = start_stats_reporting(Arc::clone(&fs), shutdown.clone());
     let flush_handle = if !db_mode.is_read_only() {
         let flush_interval_secs = settings
             .lsm
             .map(|c| c.flush_interval_secs())
             .unwrap_or(crate::config::LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS);
-        Some(start_periodic_flush(Arc::clone(&fs), flush_interval_secs))
+        Some(start_periodic_flush(
+            Arc::clone(&fs),
+            flush_interval_secs,
+            shutdown.clone(),
+        ))
     } else {
         None
     };
 
-    let checkpoint_handle =
-        checkpoint_params.map(|params| start_checkpoint_refresh(params, Arc::clone(&fs.db)));
+    let checkpoint_handle = checkpoint_params
+        .map(|params| start_checkpoint_refresh(params, Arc::clone(&fs.db), shutdown.clone()));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -683,37 +778,46 @@ pub async fn run_server(
     }
 
     tokio::select! {
-        result = futures::future::select_all(server_handles) => {
-            let (result, _, _) = result;
-            result??;
-        }
-        _ = async { gc_handle.unwrap().await }, if gc_handle.is_some() => {
-            unreachable!("GC task should never complete");
-        }
-        _ = async { flush_handle.unwrap().await }, if flush_handle.is_some() => {
-            unreachable!("Periodic flush task should never complete");
-        }
-        _ = stats_handle => {
-            unreachable!("Stats task should never complete");
-        }
-        _ = async { checkpoint_handle.unwrap().await }, if checkpoint_handle.is_some() => {
-            unreachable!("Checkpoint refresh task should never complete");
-        }
         _ = tokio::signal::ctrl_c() => {
-            info!("Received SIGINT, shutting down gracefully...");
-            if !db_mode.is_read_only() {
-                fs.flush_coordinator.flush().await?;
-            }
-            fs.db.close().await?;
+            info!("Received SIGINT, initiating graceful shutdown...");
         }
         _ = sigterm.recv() => {
-            info!("Received SIGTERM, shutting down gracefully...");
-            if !db_mode.is_read_only() {
-                fs.flush_coordinator.flush().await?;
-            }
-            fs.db.close().await?;
+            info!("Received SIGTERM, initiating graceful shutdown...");
         }
     }
 
+    info!("Cancelling all servers and background tasks...");
+    shutdown.cancel();
+
+    info!("Waiting for servers to exit...");
+    for handle in server_handles {
+        let _ = handle.await;
+    }
+
+    info!("Waiting for background tasks to exit...");
+    if let Some(gc_handle) = gc_handle {
+        let _ = gc_handle.await;
+    }
+    let _ = stats_handle.await;
+    if let Some(flush_handle) = flush_handle {
+        let _ = flush_handle.await;
+    }
+    if let Some(checkpoint_handle) = checkpoint_handle {
+        let _ = checkpoint_handle.await;
+    }
+
+    info!("Performing final flush and closing database...");
+    if !db_mode.is_read_only()
+        && let Err(e) = fs.flush_coordinator.flush().await
+    {
+        tracing::error!("Final flush failed: {:?}", e);
+    }
+
+    if let Err(e) = fs.db.close().await {
+        tracing::error!("Database close failed: {:?}", e);
+        return Err(e);
+    }
+
+    info!("Shutdown complete");
     Ok(())
 }
