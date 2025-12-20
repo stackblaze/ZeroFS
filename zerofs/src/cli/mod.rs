@@ -154,6 +154,102 @@ pub enum NbdCommands {
         #[arg(long)]
         mkfs_options: Option<String>,
     },
+    /// Export an NBD device via NFS (mounts device and configures NFS export)
+    Export {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name to export
+        name: String,
+        /// Mount point for the device (will be exported via NFS)
+        #[arg(long)]
+        mount_point: PathBuf,
+        /// NBD device path (e.g., /dev/nbd0)
+        #[arg(long, default_value = "/dev/nbd0")]
+        nbd_device: PathBuf,
+        /// Filesystem type (auto-detect if already formatted, otherwise format with this)
+        #[arg(long)]
+        filesystem: Option<String>,
+        /// NFS export path (defaults to mount_point)
+        #[arg(long)]
+        nfs_export_path: Option<String>,
+        /// NFS export options (default: rw,sync,no_subtree_check)
+        #[arg(long, default_value = "rw,sync,no_subtree_check")]
+        nfs_options: String,
+    },
+    /// Unexport an NBD device (unmount and remove NFS export)
+    Unexport {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name to unexport
+        name: String,
+        /// Mount point to unmount
+        #[arg(long)]
+        mount_point: PathBuf,
+        /// NBD device path
+        #[arg(long, default_value = "/dev/nbd0")]
+        nbd_device: PathBuf,
+    },
+    /// Create a BTRFS snapshot of an exported NBD device
+    Snapshot {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name (must be exported/mounted)
+        name: String,
+        /// Mount point where device is mounted
+        #[arg(long)]
+        mount_point: PathBuf,
+        /// Snapshot name
+        snapshot_name: String,
+        /// Snapshot path (relative to mount point, defaults to .snapshots/<name>)
+        #[arg(long)]
+        snapshot_path: Option<String>,
+        /// Create read-only snapshot
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// List BTRFS snapshots for an exported NBD device
+    Snapshots {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name
+        name: String,
+        /// Mount point where device is mounted
+        #[arg(long)]
+        mount_point: PathBuf,
+    },
+    /// Restore from a BTRFS snapshot
+    Restore {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name
+        name: String,
+        /// Mount point where device is mounted
+        #[arg(long)]
+        mount_point: PathBuf,
+        /// Snapshot name to restore from
+        snapshot_name: String,
+        /// Snapshot path (relative to mount point, defaults to .snapshots/<name>)
+        #[arg(long)]
+        snapshot_path: Option<String>,
+        /// Target path to restore to (defaults to root of filesystem)
+        #[arg(long)]
+        target_path: Option<String>,
+    },
+    /// Delete a BTRFS snapshot
+    DeleteSnapshot {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name
+        name: String,
+        /// Mount point where device is mounted
+        #[arg(long)]
+        mount_point: PathBuf,
+        /// Snapshot name to delete
+        snapshot_name: String,
+        /// Snapshot path (relative to mount point, defaults to .snapshots/<name>)
+        #[arg(long)]
+        snapshot_path: Option<String>,
+    },
 }
 
 impl Cli {
