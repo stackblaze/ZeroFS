@@ -141,6 +141,19 @@ pub enum NbdCommands {
         /// New size (e.g., 10G, 512M, 1T)
         size: String,
     },
+    /// Format an NBD device with a filesystem
+    Format {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Device name to format
+        name: String,
+        /// Filesystem type (currently supports: btrfs)
+        #[arg(default_value = "btrfs")]
+        filesystem: String,
+        /// Additional mkfs options (passed directly to mkfs command)
+        #[arg(long)]
+        mkfs_options: Option<String>,
+    },
 }
 
 impl Cli {

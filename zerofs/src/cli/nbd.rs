@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use comfy_table::{Cell, Color, Table};
 use num_format::{Locale, ToFormattedString};
 use std::path::PathBuf;
+use std::process::Command;
 
 fn get_control_socket_path(config: &PathBuf) -> Result<String> {
     let settings = Settings::from_file(config.to_str().unwrap())
@@ -131,6 +132,153 @@ pub async fn resize_device(config: PathBuf, name: String, size: String) -> Resul
         _ => anyhow::bail!("Unexpected response from server"),
     }
 }
+
+pub async fn format_device(
+    config: PathBuf,
+    name: String,
+    filesystem: String,
+    mkfs_options: Option<String>,
+) -> Result<()> {
+    let settings = Settings::from_file(config.to_str().unwrap())
+        .with_context(|| format!("Failed to load config from {}", config.display()))?;
+
+    // Verify device exists
+    let socket_path = get_control_socket_path(&config)?;
+    let request = ControlRequest::ListDevices;
+    let response = send_control_request(&socket_path, request).await?;
+
+    let device_info = match response {
+        ControlResponse::DeviceList { devices } => {
+            devices
+                .into_iter()
+                .find(|d| d.name == name)
+                .ok_or_else(|| anyhow::anyhow!("Device '{}' not found", name))?
+        }
+        ControlResponse::Error { message } => {
+            anyhow::bail!("Failed to list devices: {}", message)
+        }
+        _ => anyhow::bail!("Unexpected response from server"),
+    };
+
+    println!("Formatting device '{}' ({}) with {} filesystem...", 
+             name, format_size(device_info.size), filesystem);
+    println!("(Formatting directly on server - no network overhead)");
+
+    // Mount ZeroFS locally to access the device file directly
+    // Prefer 9P Unix socket for best performance, fallback to NFS localhost
+    let mount_point = format!("/tmp/zerofs-format-{}", std::process::id());
+    let device_path = format!("{}/.nbd/{}", mount_point, name);
+
+    // Create temporary mount point
+    std::fs::create_dir_all(&mount_point)
+        .context("Failed to create temporary mount point")?;
+
+    // Determine mount method (prefer 9P Unix socket, then 9P TCP, then NFS)
+    let mount_result = if let Some(ninep_config) = &settings.servers.ninep {
+        if let Some(ref socket_path) = ninep_config.unix_socket {
+            // Mount via 9P Unix socket (best performance)
+            Command::new("mount")
+                .arg("-t")
+                .arg("9p")
+                .arg("-o")
+                .arg("trans=unix,version=9p2000.L,cache=mmap,access=user")
+                .arg(socket_path.to_str().unwrap())
+                .arg(&mount_point)
+                .status()
+        } else if let Some(ref addrs) = ninep_config.addresses {
+            // Mount via 9P TCP
+            let addr = addrs.iter().next()
+                .ok_or_else(|| anyhow::anyhow!("No 9P server addresses configured"))?;
+            Command::new("mount")
+                .arg("-t")
+                .arg("9p")
+                .arg("-o")
+                .arg(format!("trans=tcp,port={},version=9p2000.L,cache=mmap,access=user", addr.port()))
+                .arg("127.0.0.1")
+                .arg(&mount_point)
+                .status()
+        } else {
+            anyhow::bail!("No 9P server configured. Please configure 9P or NFS server in zerofs.toml");
+        }
+    } else if let Some(_nfs_config) = &settings.servers.nfs {
+        // Mount via NFS localhost
+        Command::new("mount")
+            .arg("-t")
+            .arg("nfs")
+            .arg("-o")
+            .arg("vers=3,nolock,tcp,port=2049,mountport=2049")
+            .arg("127.0.0.1:/")
+            .arg(&mount_point)
+            .status()
+    } else {
+        anyhow::bail!("No file access protocol (9P or NFS) configured. Please configure at least one in zerofs.toml");
+    };
+
+    let mount_status = mount_result
+        .context("Failed to execute mount command. Make sure you have permission to mount filesystems.")?;
+
+    if !mount_status.success() {
+        let _ = std::fs::remove_dir(&mount_point);
+        anyhow::bail!("Failed to mount ZeroFS locally. Is the server running? You may need sudo privileges.");
+    }
+
+    // Verify device file exists
+    if !std::path::Path::new(&device_path).exists() {
+        let _ = Command::new("umount").arg(&mount_point).status();
+        let _ = std::fs::remove_dir(&mount_point);
+        anyhow::bail!("Device file not found at {}", device_path);
+    }
+
+    // Format the device file directly (mkfs.btrfs can format regular files)
+    let format_result = match filesystem.to_lowercase().as_str() {
+        "btrfs" => {
+            let mut cmd = Command::new("mkfs.btrfs");
+            cmd.arg("-f"); // Force formatting
+            
+            // Add custom options if provided
+            if let Some(opts) = &mkfs_options {
+                // Parse options (simple space-separated)
+                for opt in opts.split_whitespace() {
+                    cmd.arg(opt);
+                }
+            }
+            
+            cmd.arg(&device_path);
+            cmd.status()
+        }
+        _ => {
+            let _ = Command::new("umount").arg(&mount_point).status();
+            let _ = std::fs::remove_dir(&mount_point);
+            anyhow::bail!("Unsupported filesystem type: {}. Currently only 'btrfs' is supported.", filesystem);
+        }
+    };
+
+    let format_status = format_result
+        .with_context(|| format!("Failed to execute mkfs.{}. Is it installed?", filesystem))?;
+
+    // Unmount and cleanup
+    let umount_status = Command::new("umount")
+        .arg(&mount_point)
+        .status()
+        .context("Failed to unmount ZeroFS")?;
+    
+    let _ = std::fs::remove_dir(&mount_point);
+
+    if !umount_status.success() {
+        eprintln!("Warning: Failed to unmount {}. You may need to unmount manually.", mount_point);
+    }
+
+    if !format_status.success() {
+        anyhow::bail!("Failed to format device with {} filesystem", filesystem);
+    }
+
+    println!("✓ Successfully formatted device '{}' with {} filesystem", name, filesystem);
+    println!("  Device size: {}", format_size(device_info.size));
+    println!("  Formatting completed server-side (no network overhead)");
+
+    Ok(())
+}
+
 
 fn parse_size(size: &str) -> Result<u64> {
     let size = size.trim().to_uppercase();

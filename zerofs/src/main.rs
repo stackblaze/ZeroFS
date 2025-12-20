@@ -113,6 +113,9 @@ async fn main() -> Result<()> {
             cli::NbdCommands::Resize { config, name, size } => {
                 cli::nbd::resize_device(config, name, size).await?;
             }
+            cli::NbdCommands::Format { config, name, filesystem, mkfs_options } => {
+                cli::nbd::format_device(config, name, filesystem, mkfs_options).await?;
+            }
         },
         cli::Commands::Fatrace { config } => {
             cli::fatrace::run_fatrace(config).await?;
