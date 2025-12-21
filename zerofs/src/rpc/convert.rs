@@ -1,4 +1,5 @@
 use crate::checkpoint_manager::CheckpointInfo;
+use crate::fs::subvolume::Subvolume;
 use crate::fs::tracing::{FileAccessEvent, FileOperation};
 use crate::rpc::proto;
 use prost_types::Timestamp;
@@ -156,5 +157,43 @@ impl From<FileAccessEvent> for proto::FileAccessEvent {
             path: event.path,
             params: Some(params),
         }
+    }
+}
+
+impl From<Subvolume> for proto::SubvolumeInfo {
+    fn from(subvol: Subvolume) -> Self {
+        proto::SubvolumeInfo {
+            id: subvol.id,
+            name: subvol.name,
+            uuid: subvol.uuid.to_string(),
+            parent_id: subvol.parent_id,
+            parent_uuid: subvol.parent_uuid.map(|u| u.to_string()),
+            root_inode: subvol.root_inode,
+            created_at: subvol.created_at,
+            is_readonly: subvol.is_readonly,
+            is_snapshot: subvol.is_snapshot,
+            generation: subvol.generation,
+            flags: subvol.flags,
+        }
+    }
+}
+
+impl TryFrom<proto::SubvolumeInfo> for Subvolume {
+    type Error = uuid::Error;
+
+    fn try_from(proto: proto::SubvolumeInfo) -> Result<Self, Self::Error> {
+        Ok(Subvolume {
+            id: proto.id,
+            name: proto.name,
+            uuid: Uuid::parse_str(&proto.uuid)?,
+            parent_id: proto.parent_id,
+            parent_uuid: proto.parent_uuid.as_ref().map(|s| Uuid::parse_str(s)).transpose()?,
+            root_inode: proto.root_inode,
+            created_at: proto.created_at,
+            is_readonly: proto.is_readonly,
+            is_snapshot: proto.is_snapshot,
+            generation: proto.generation,
+            flags: proto.flags,
+        })
     }
 }

@@ -135,6 +135,38 @@ async fn main() -> Result<()> {
                 cli::nbd::delete_snapshot(config, name, mount_point, snapshot_name, snapshot_path).await?;
             }
         },
+        cli::Commands::Subvolume { subcommand } => match subcommand {
+            cli::SubvolumeCommands::Create { config, name } => {
+                cli::subvolume::create_subvolume(&config, &name).await?;
+            }
+            cli::SubvolumeCommands::List { config } => {
+                cli::subvolume::list_subvolumes(&config).await?;
+            }
+            cli::SubvolumeCommands::Delete { config, name } => {
+                cli::subvolume::delete_subvolume(&config, &name).await?;
+            }
+            cli::SubvolumeCommands::Info { config, name } => {
+                cli::subvolume::get_subvolume_info(&config, &name).await?;
+            }
+            cli::SubvolumeCommands::Snapshot { config, source, name, readonly } => {
+                cli::subvolume::create_snapshot(&config, &source, &name, readonly).await?;
+            }
+            cli::SubvolumeCommands::ListSnapshots { config } => {
+                cli::subvolume::list_snapshots(&config).await?;
+            }
+            cli::SubvolumeCommands::DeleteSnapshot { config, name } => {
+                cli::subvolume::delete_snapshot(&config, &name).await?;
+            }
+            cli::SubvolumeCommands::SetDefault { config, name } => {
+                cli::subvolume::set_default_subvolume(&config, &name).await?;
+            }
+            cli::SubvolumeCommands::GetDefault { config } => {
+                cli::subvolume::get_default_subvolume(&config).await?;
+            }
+            cli::SubvolumeCommands::Restore { config, snapshot, source, destination } => {
+                cli::subvolume::restore_from_snapshot(&config, &snapshot, &source, &destination).await?;
+            }
+        },
         cli::Commands::Fatrace { config } => {
             cli::fatrace::run_fatrace(config).await?;
         }

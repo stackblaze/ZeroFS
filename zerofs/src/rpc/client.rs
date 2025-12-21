@@ -1,5 +1,6 @@
 use crate::checkpoint_manager::CheckpointInfo;
 use crate::config::RpcConfig;
+use crate::fs::subvolume::Subvolume;
 use crate::rpc::proto::{self, admin_service_client::AdminServiceClient};
 use anyhow::{Context, Result, anyhow};
 use hyper_util::rt::TokioIo;
@@ -163,5 +164,199 @@ impl RpcClient {
             .map_err(|s| anyhow!("Failed to start file access stream: {}", s.message()))?;
 
         Ok(response.into_inner())
+    }
+
+    // Subvolume operations
+    pub async fn create_subvolume(&self, name: &str) -> Result<Subvolume> {
+        let request = proto::CreateSubvolumeRequest {
+            name: name.to_string(),
+        };
+
+        let response = self
+            .client
+            .clone()
+            .create_subvolume(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        response
+            .subvolume
+            .ok_or_else(|| anyhow!("Empty response from server"))?
+            .try_into()
+            .map_err(|e| anyhow!("Invalid UUID: {}", e))
+    }
+
+    pub async fn list_subvolumes(&self) -> Result<Vec<Subvolume>> {
+        let request = proto::ListSubvolumesRequest {};
+
+        let response = self
+            .client
+            .clone()
+            .list_subvolumes(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        response
+            .subvolumes
+            .into_iter()
+            .map(|s| s.try_into().map_err(|e| anyhow!("Invalid UUID: {}", e)))
+            .collect()
+    }
+
+    pub async fn delete_subvolume(&self, name: &str) -> Result<()> {
+        let request = proto::DeleteSubvolumeRequest {
+            name: name.to_string(),
+        };
+
+        self.client
+            .clone()
+            .delete_subvolume(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?;
+
+        Ok(())
+    }
+
+    pub async fn get_subvolume_info(&self, name: &str) -> Result<Option<Subvolume>> {
+        let request = proto::GetSubvolumeInfoRequest {
+            name: name.to_string(),
+        };
+
+        let result = self.client.clone().get_subvolume_info(request).await;
+
+        match result {
+            Ok(response) => {
+                let info = response
+                    .into_inner()
+                    .subvolume
+                    .ok_or_else(|| anyhow!("Empty response from server"))?;
+                Ok(Some(
+                    info.try_into()
+                        .map_err(|e| anyhow!("Invalid UUID: {}", e))?,
+                ))
+            }
+            Err(status) if status.code() == Code::NotFound => Ok(None),
+            Err(status) => Err(anyhow!("RPC call failed: {}", status.message())),
+        }
+    }
+
+    pub async fn set_default_subvolume(&self, name: &str) -> Result<()> {
+        let request = proto::SetDefaultSubvolumeRequest {
+            name: name.to_string(),
+        };
+
+        self.client
+            .clone()
+            .set_default_subvolume(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?;
+
+        Ok(())
+    }
+
+    pub async fn get_default_subvolume(&self) -> Result<u64> {
+        let request = proto::GetDefaultSubvolumeRequest {};
+
+        let response = self
+            .client
+            .clone()
+            .get_default_subvolume(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        Ok(response.subvolume_id)
+    }
+
+    // Snapshot operations
+    pub async fn create_snapshot_with_options(&self, source_name: &str, snapshot_name: &str, readonly: bool) -> Result<Subvolume> {
+        let request = proto::CreateSnapshotRequest {
+            source_name: source_name.to_string(),
+            snapshot_name: snapshot_name.to_string(),
+            readonly: Some(readonly),
+        };
+
+        let response = self
+            .client
+            .clone()
+            .create_snapshot(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        response
+            .snapshot
+            .ok_or_else(|| anyhow!("Empty response from server"))?
+            .try_into()
+            .map_err(|e| anyhow!("Invalid UUID: {}", e))
+    }
+
+    pub async fn list_snapshots(&self) -> Result<Vec<Subvolume>> {
+        let request = proto::ListSnapshotsRequest {};
+
+        let response = self
+            .client
+            .clone()
+            .list_snapshots(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        response
+            .snapshots
+            .into_iter()
+            .map(|s| s.try_into().map_err(|e| anyhow!("Invalid UUID: {}", e)))
+            .collect()
+    }
+
+    pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
+        let request = proto::DeleteSnapshotRequest {
+            name: name.to_string(),
+        };
+
+        self.client
+            .clone()
+            .delete_snapshot(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?;
+
+        Ok(())
+    }
+
+    pub async fn read_snapshot_file(
+        &self,
+        snapshot_name: &str,
+        file_path: &str,
+    ) -> Result<Vec<u8>> {
+        use futures::StreamExt;
+        
+        let request = proto::ReadSnapshotFileRequest {
+            snapshot_name: snapshot_name.to_string(),
+            file_path: file_path.to_string(),
+        };
+
+        let mut stream = self
+            .client
+            .clone()
+            .read_snapshot_file(request)
+            .await
+            .map_err(|s| anyhow!("Failed to read snapshot file: {}", s.message()))?
+            .into_inner();
+
+        let mut file_data = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|s| anyhow!("Stream error: {}", s.message()))?;
+            file_data.extend_from_slice(&chunk.data);
+        }
+
+        Ok(file_data)
+    }
+
+    // Convenience method for creating read-write snapshots (default, like btrfs)
+    pub async fn create_snapshot(&self, source_name: &str, snapshot_name: &str) -> Result<Subvolume> {
+        self.create_snapshot_with_options(source_name, snapshot_name, false).await
     }
 }

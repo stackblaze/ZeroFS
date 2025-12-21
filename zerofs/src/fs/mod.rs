@@ -6,8 +6,11 @@ pub mod key_codec;
 pub mod lock_manager;
 pub mod metrics;
 pub mod permissions;
+pub mod snapshot_manager;
+pub mod snapshot_vfs;
 pub mod stats;
 pub mod store;
+pub mod subvolume;
 pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
@@ -18,8 +21,9 @@ use self::flush_coordinator::FlushCoordinator;
 use self::key_codec::KeyCodec;
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
+use self::snapshot_vfs::SnapshotVfs;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
-use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore};
+use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore, SubvolumeStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
@@ -83,6 +87,8 @@ pub struct ZeroFS {
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
     pub tombstone_store: TombstoneStore,
+    pub subvolume_store: SubvolumeStore,
+    pub snapshot_vfs: SnapshotVfs,
     pub lock_manager: Arc<LockManager>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
@@ -177,6 +183,11 @@ impl ZeroFS {
         let directory_store = DirectoryStore::new(db.clone());
         let inode_store = InodeStore::new(db.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone());
+        
+        // Get current time for subvolume initialization
+        let (now_sec, _) = get_current_time();
+        let subvolume_store = SubvolumeStore::new(db.clone(), 0, now_sec).await?;
+        let snapshot_vfs = SnapshotVfs::new(subvolume_store.clone());
 
         let fs = Self {
             db: db.clone(),
@@ -184,6 +195,8 @@ impl ZeroFS {
             directory_store,
             inode_store,
             tombstone_store,
+            subvolume_store,
+            snapshot_vfs,
             lock_manager,
             stats,
             global_stats,
@@ -233,7 +246,7 @@ impl ZeroFS {
         let mut current_id = id;
 
         while current_id != ROOT_INODE_ID {
-            if let Ok(inode) = self.inode_store.get(current_id).await {
+            if let Ok(inode) = self.get_inode(current_id).await {
                 let parent_id = match inode.parent() {
                     Some(p) => p,
                     None => {
@@ -258,6 +271,25 @@ impl ZeroFS {
 
         components.reverse();
         components
+    }
+
+    /// Get an inode - handles both real inodes and virtual snapshot directory inodes
+    pub async fn get_inode(&self, id: InodeId) -> Result<Inode, FsError> {
+        // Handle virtual .snapshots directory
+        if id == snapshot_vfs::SNAPSHOTS_DIR_INODE {
+            let (now_sec, _) = get_current_time();
+            return Ok(self.snapshot_vfs.get_snapshots_dir_inode(now_sec));
+        }
+
+        // Handle virtual snapshot directories
+        if SnapshotVfs::is_snapshot_dir(id) {
+            if let Some(snapshot_id) = SnapshotVfs::snapshot_id_from_inode(id) {
+                return self.snapshot_vfs.get_snapshot_dir_inode(snapshot_id).await;
+            }
+        }
+
+        // Regular inode from store
+        self.inode_store.get(id).await
     }
 
     /// Resolve inode ID to full path string
@@ -780,6 +812,29 @@ impl ZeroFS {
             String::from_utf8_lossy(filename)
         );
 
+        // Handle virtual .snapshots directory in root
+        if dirid == 0 && SnapshotVfs::is_snapshots_name(filename) {
+            debug!("lookup: found .snapshots virtual directory");
+            return Ok(snapshot_vfs::SNAPSHOTS_DIR_INODE);
+        }
+
+        // Handle lookups inside .snapshots directory
+        if dirid == snapshot_vfs::SNAPSHOTS_DIR_INODE {
+            debug!("lookup: inside .snapshots, looking for snapshot: {}", String::from_utf8_lossy(filename));
+            let snapshot_inode = self.snapshot_vfs.lookup_in_snapshots(filename).await?;
+            return Ok(snapshot_inode);
+        }
+
+        // Handle lookups inside snapshot directories - redirect to actual snapshot root
+        if SnapshotVfs::is_snapshot_dir(dirid) {
+            if let Some(snapshot_id) = SnapshotVfs::snapshot_id_from_inode(dirid) {
+                let actual_root = self.snapshot_vfs.get_snapshot_root_inode(snapshot_id).await?;
+                debug!("lookup: redirecting from virtual snapshot dir {} to actual root {}", dirid, actual_root);
+                // Perform lookup in the actual snapshot root using Box to avoid recursion issue
+                return Box::pin(self.lookup(creds, actual_root, filename)).await;
+            }
+        }
+
         let dir_inode = self.inode_store.get(dirid).await?;
 
         match dir_inode {
@@ -807,8 +862,9 @@ impl ZeroFS {
                     }
                     Err(FsError::NotFound) => {
                         debug!(
-                            "lookup not found: {} in directory",
-                            String::from_utf8_lossy(filename)
+                            "lookup not found: {} in directory {}",
+                            String::from_utf8_lossy(filename),
+                            dirid
                         );
                         Err(FsError::NotFound)
                     }
@@ -817,6 +873,90 @@ impl ZeroFS {
             }
             _ => Err(FsError::NotDirectory),
         }
+    }
+
+    /// Read directory entries for the virtual .snapshots directory
+    async fn readdir_snapshots(
+        &self,
+        auth: &AuthContext,
+        start_after: InodeId,
+        max_entries: usize,
+    ) -> Result<ReadDirResult, FsError> {
+        let creds = Credentials::from_auth_context(auth);
+        let snapshots_dir_inode = self.get_inode(snapshot_vfs::SNAPSHOTS_DIR_INODE).await?;
+        check_access(&snapshots_dir_inode, &creds, AccessMode::Read)?;
+
+        use crate::fs::store::directory::{COOKIE_DOT, COOKIE_DOTDOT};
+        use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
+
+        let mut entries = Vec::new();
+
+        // Handle . and ..
+        if start_after < COOKIE_DOT {
+            entries.push(DirEntry {
+                fileid: snapshot_vfs::SNAPSHOTS_DIR_INODE,
+                name: b".".to_vec(),
+                attr: InodeWithId {
+                    inode: &snapshots_dir_inode,
+                    id: snapshot_vfs::SNAPSHOTS_DIR_INODE,
+                }
+                .into(),
+                cookie: COOKIE_DOT,
+            });
+        }
+
+        if start_after < COOKIE_DOTDOT {
+            let root_inode = self.get_inode(0).await?;
+            entries.push(DirEntry {
+                fileid: 0,
+                name: b"..".to_vec(),
+                attr: InodeWithId {
+                    inode: &root_inode,
+                    id: 0,
+                }
+                .into(),
+                cookie: COOKIE_DOTDOT,
+            });
+        }
+
+        // List all snapshots
+        let snapshots = self.snapshot_vfs.list_snapshots().await;
+        let mut cookie = COOKIE_FIRST_ENTRY;
+
+        for snapshot in snapshots {
+            if cookie <= start_after {
+                cookie += 1;
+                continue;
+            }
+
+            if entries.len() >= max_entries {
+                break;
+            }
+
+            let snapshot_virtual_inode = SnapshotVfs::inode_for_snapshot(snapshot.id);
+            let snapshot_dir_inode = self.get_inode(snapshot_virtual_inode).await?;
+
+            entries.push(DirEntry {
+                fileid: snapshot_virtual_inode,
+                name: snapshot.name.as_bytes().to_vec(),
+                attr: InodeWithId {
+                    inode: &snapshot_dir_inode,
+                    id: snapshot_virtual_inode,
+                }
+                .into(),
+                cookie,
+            });
+
+            cookie += 1;
+        }
+
+        self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+        Ok(ReadDirResult {
+            entries,
+            end: true, // Snapshots list is complete
+        })
     }
 
     pub async fn mkdir(
@@ -834,8 +974,24 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
+        // Check if we're in the .snapshots directory itself (not allowed to create here)
+        if SnapshotVfs::is_snapshots_dir(dirid) {
+            return Err(FsError::ReadOnlyFilesystem);
+        }
+        
+        // For snapshot directories, check if the snapshot is readonly
+        if SnapshotVfs::is_snapshot_dir(dirid) {
+            if let Some(snapshot_id) = SnapshotVfs::snapshot_id_from_inode(dirid) {
+                if let Some(snapshot) = self.subvolume_store.get_by_id(snapshot_id).await {
+                    if snapshot.is_readonly {
+                        return Err(FsError::ReadOnlyFilesystem);
+                    }
+                }
+            }
+        }
+
         let _guard = self.lock_manager.acquire_write(dirid).await;
-        let mut dir_inode = self.inode_store.get(dirid).await?;
+        let mut dir_inode = self.get_inode(dirid).await?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
@@ -970,7 +1126,23 @@ impl ZeroFS {
         start_after: InodeId,
         max_entries: usize,
     ) -> Result<ReadDirResult, FsError> {
-        let dir_inode = self.inode_store.get(dirid).await?;
+        debug!("readdir called: dirid={}, start_after={}, max_entries={}", dirid, start_after, max_entries);
+        
+        // Handle virtual .snapshots directory readdir
+        if dirid == snapshot_vfs::SNAPSHOTS_DIR_INODE {
+            return self.readdir_snapshots(auth, start_after, max_entries).await;
+        }
+
+        // Handle virtual snapshot directory readdir - redirect to actual snapshot root
+        if SnapshotVfs::is_snapshot_dir(dirid) {
+            if let Some(snapshot_id) = SnapshotVfs::snapshot_id_from_inode(dirid) {
+                let actual_root = self.snapshot_vfs.get_snapshot_root_inode(snapshot_id).await?;
+                debug!("readdir: redirecting from virtual snapshot dir {} to actual root {}", dirid, actual_root);
+                return Box::pin(self.readdir(auth, actual_root, start_after, max_entries)).await;
+            }
+        }
+
+        let dir_inode = self.get_inode(dirid).await?;
 
         let creds = Credentials::from_auth_context(auth);
         check_access(&dir_inode, &creds, AccessMode::Read)?;
@@ -997,20 +1169,12 @@ impl ZeroFS {
 
                 if start_after < COOKIE_DOTDOT {
                     let parent_id = if dirid == 0 { 0 } else { dir.parent };
-                    let parent_attr = if parent_id == dirid {
-                        InodeWithId {
-                            inode: &dir_inode,
-                            id: dirid,
-                        }
-                        .into()
-                    } else {
-                        let parent_inode = self.inode_store.get(parent_id).await?;
-                        InodeWithId {
+                    let parent_inode = self.get_inode(parent_id).await?;
+                    let parent_attr = InodeWithId {
                             inode: &parent_inode,
                             id: parent_id,
                         }
-                        .into()
-                    };
+                    .into();
                     entries.push(DirEntry {
                         fileid: parent_id,
                         name: b"..".to_vec(),
@@ -1019,9 +1183,39 @@ impl ZeroFS {
                     });
                 }
 
+                // Add .snapshots entry in root directory
+                // Cookie ordering: . (1), .. (2), .snapshots (use a high cookie value to avoid conflicts)
+                use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
+                // Use a cookie value that's much higher than regular entries to avoid conflicts
+                // Regular entries start at COOKIE_FIRST_ENTRY (3), so we'll use a value after all possible regular cookies
+                const SNAPSHOTS_COOKIE: u64 = 0xFFFFFFFF00000000; // High cookie value for .snapshots
+                
+                // Add .snapshots if we're in root and haven't passed it yet
+                // Include it after .. (cookie 2) but before we start listing regular entries
+                if dirid == 0 && start_after < SNAPSHOTS_COOKIE {
+                    debug!("Adding .snapshots entry to readdir results for root directory");
+                    let snapshots_inode = self.get_inode(snapshot_vfs::SNAPSHOTS_DIR_INODE).await?;
+                    entries.push(DirEntry {
+                        fileid: snapshot_vfs::SNAPSHOTS_DIR_INODE,
+                        name: b".snapshots".to_vec(),
+                        attr: InodeWithId {
+                            inode: &snapshots_inode,
+                            id: snapshot_vfs::SNAPSHOTS_DIR_INODE,
+                        }
+                        .into(),
+                        cookie: SNAPSHOTS_COOKIE,
+                    });
+                }
+
                 // Get regular entries, starting after the given cookie
                 let iter = if start_after < COOKIE_DOTDOT {
                     self.directory_store.list(dirid).await?
+                } else if dirid == 0 && start_after < SNAPSHOTS_COOKIE {
+                    // If we're before .snapshots cookie, list regular entries normally
+                    self.directory_store.list_from(dirid, COOKIE_FIRST_ENTRY).await?
+                } else if dirid == 0 && start_after >= SNAPSHOTS_COOKIE {
+                    // If we've passed .snapshots, continue with regular entries
+                    self.directory_store.list_from(dirid, COOKIE_FIRST_ENTRY).await?
                 } else {
                     self.directory_store.list_from(dirid, start_after).await?
                 };
@@ -1043,7 +1237,7 @@ impl ZeroFS {
 
                 let inode_futures = stream::iter(dir_entries.into_iter()).map(
                     |(inode_id, name, cookie)| async move {
-                        match self.inode_store.get(inode_id).await {
+                        match self.get_inode(inode_id).await {
                             Ok(inode) => Ok::<_, FsError>(Some((inode_id, name, inode, cookie))),
                             Err(FsError::NotFound) => {
                                 // Inode was deleted between directory listing and fetch - skip it

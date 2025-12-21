@@ -7,6 +7,7 @@ pub mod fatrace;
 pub mod nbd;
 pub mod password;
 pub mod server;
+pub mod subvolume;
 
 #[derive(Parser)]
 #[command(name = "zerofs")]
@@ -59,6 +60,11 @@ pub enum Commands {
     Nbd {
         #[command(subcommand)]
         subcommand: NbdCommands,
+    },
+    /// Subvolume and snapshot management commands
+    Subvolume {
+        #[command(subcommand)]
+        subcommand: SubvolumeCommands,
     },
     /// Trace file system operations in real-time
     Fatrace {
@@ -249,6 +255,86 @@ pub enum NbdCommands {
         /// Snapshot path (relative to mount point, defaults to .snapshots/<name>)
         #[arg(long)]
         snapshot_path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SubvolumeCommands {
+    /// Create a new subvolume
+    Create {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Subvolume name (must be unique)
+        name: String,
+    },
+    /// List all subvolumes
+    List {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Delete a subvolume
+    Delete {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Subvolume name to delete
+        name: String,
+    },
+    /// Get subvolume information
+    Info {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Subvolume name to query
+        name: String,
+    },
+    /// Create a snapshot of a subvolume
+    Snapshot {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Source subvolume name
+        source: String,
+        /// Snapshot name (must be unique)
+        name: String,
+        /// Create read-only snapshot (default: read-write, like btrfs)
+        #[arg(long)]
+        readonly: bool,
+    },
+    /// List all snapshots
+    ListSnapshots {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Delete a snapshot
+    DeleteSnapshot {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Snapshot name to delete
+        name: String,
+    },
+    /// Set the default subvolume
+    SetDefault {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Subvolume name to set as default
+        name: String,
+    },
+    /// Get the default subvolume
+    GetDefault {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Restore a file from a snapshot
+    Restore {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Snapshot name to restore from
+        #[arg(long)]
+        snapshot: String,
+        /// Path to file/directory within snapshot (e.g., /mnt/my-volume/file.txt)
+        #[arg(long)]
+        source: String,
+        /// Destination path to restore to (e.g., /tmp/restored-file.txt)
+        #[arg(long)]
+        destination: String,
     },
 }
 

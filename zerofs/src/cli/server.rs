@@ -209,7 +209,9 @@ async fn start_nbd_servers(
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
+    snapshot_manager: Arc<crate::fs::snapshot_manager::SnapshotManager>,
     tracer: AccessTracer,
+    fs: Arc<crate::fs::ZeroFS>,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
@@ -217,7 +219,7 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, tracer);
+    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, snapshot_manager, tracer, fs.clone());
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -726,10 +728,21 @@ pub async fn run_server(
         slatedb::object_store::path::Path::from(init_result.db_path),
         init_result.object_store,
     ));
+    
+    // Create snapshot manager
+    let snapshot_manager = Arc::new(crate::fs::snapshot_manager::SnapshotManager::new(
+        fs.db.clone(),
+        fs.inode_store.clone(),
+        fs.subvolume_store.clone(),
+        fs.directory_store.clone(),
+    ));
+    
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
+        snapshot_manager,
         fs.tracer.clone(),
+        fs.clone(),
         shutdown.clone(),
     )
     .await;

@@ -27,6 +27,8 @@ const PREFIX_DIR_COOKIE: u8 = 0x04;
 const PREFIX_STATS: u8 = 0x05;
 const PREFIX_SYSTEM: u8 = 0x06;
 const PREFIX_TOMBSTONE: u8 = 0x07;
+const PREFIX_SUBVOLUME: u8 = 0x08;
+const PREFIX_SUBVOLUME_REGISTRY: u8 = 0x09;
 const PREFIX_CHUNK: u8 = 0xFE;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
@@ -48,6 +50,8 @@ pub enum KeyPrefix {
     Stats,
     System,
     DirCookie,
+    Subvolume,
+    SubvolumeRegistry,
 }
 
 impl TryFrom<u8> for KeyPrefix {
@@ -63,6 +67,8 @@ impl TryFrom<u8> for KeyPrefix {
             PREFIX_STATS => Ok(Self::Stats),
             PREFIX_SYSTEM => Ok(Self::System),
             PREFIX_DIR_COOKIE => Ok(Self::DirCookie),
+            PREFIX_SUBVOLUME => Ok(Self::Subvolume),
+            PREFIX_SUBVOLUME_REGISTRY => Ok(Self::SubvolumeRegistry),
             _ => Err(()),
         }
     }
@@ -79,6 +85,8 @@ impl From<KeyPrefix> for u8 {
             KeyPrefix::Stats => PREFIX_STATS,
             KeyPrefix::System => PREFIX_SYSTEM,
             KeyPrefix::DirCookie => PREFIX_DIR_COOKIE,
+            KeyPrefix::Subvolume => PREFIX_SUBVOLUME,
+            KeyPrefix::SubvolumeRegistry => PREFIX_SUBVOLUME_REGISTRY,
         }
     }
 }
@@ -94,6 +102,8 @@ impl KeyPrefix {
             Self::Stats => "STATS",
             Self::System => "SYSTEM",
             Self::DirCookie => "DIR_COOKIE",
+            Self::Subvolume => "SUBVOLUME",
+            Self::SubvolumeRegistry => "SUBVOLUME_REGISTRY",
         }
     }
 }
@@ -297,6 +307,19 @@ impl KeyCodec {
         let start = Bytes::from(vec![prefix_byte]);
         let end = Bytes::from(vec![prefix_byte + 1]);
         (start, end)
+    }
+
+    /// Key for storing the subvolume registry (singleton)
+    pub fn subvolume_registry_key() -> Bytes {
+        Bytes::from(vec![u8::from(KeyPrefix::SubvolumeRegistry)])
+    }
+
+    /// Key for storing individual subvolume metadata
+    pub fn subvolume_key(subvolume_id: u64) -> Bytes {
+        let mut key = Vec::with_capacity(KEY_INODE_SIZE);
+        key.push(u8::from(KeyPrefix::Subvolume));
+        key.extend_from_slice(&subvolume_id.to_be_bytes());
+        Bytes::from(key)
     }
 }
 
