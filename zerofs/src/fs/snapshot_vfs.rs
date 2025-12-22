@@ -30,7 +30,7 @@ impl SnapshotVfs {
 
     /// Check if this is a virtual snapshot directory inode
     pub fn is_snapshot_dir(inode_id: InodeId) -> bool {
-        inode_id >= SNAPSHOT_BASE_INODE && inode_id < SNAPSHOTS_DIR_INODE
+        (SNAPSHOT_BASE_INODE..SNAPSHOTS_DIR_INODE).contains(&inode_id)
     }
 
     /// Get snapshot ID from virtual inode ID

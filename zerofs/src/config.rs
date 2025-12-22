@@ -264,8 +264,7 @@ impl WritebackConfig {
     pub fn flush_threshold_percent(&self) -> u8 {
         self.flush_threshold_percent
             .unwrap_or(Self::DEFAULT_FLUSH_THRESHOLD_PERCENT)
-            .min(100)
-            .max(10)
+            .clamp(10, 100)
     }
 
     pub fn sync_on_write(&self) -> bool {

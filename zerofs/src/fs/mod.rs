@@ -1146,9 +1146,8 @@ impl ZeroFS {
                         has_more = true;
                         break;
                     }
-                    let entry = result.map_err(|e| {
+                    let entry = result.inspect_err(|e| {
                         error!("readdir: failed to get entry for dir {}: {:?}", dirid, e);
-                        e
                     })?;
                     // Filter out /snapshots entry in root directory - users should use .snapshots instead
                     if dirid == 0 && entry.name == b"snapshots" {

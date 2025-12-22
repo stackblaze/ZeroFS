@@ -176,7 +176,7 @@ pub async fn list_snapshots(config_path: &Path) -> Result<()> {
 
     // Get all datasets to map IDs to names
     let datasets = client.list_datasets().await?;
-    let mut id_to_name: std::collections::HashMap<u64, String> =
+    let id_to_name: std::collections::HashMap<u64, String> =
         datasets.into_iter().map(|s| (s.id, s.name)).collect();
 
     let mut table = Table::new();
@@ -244,7 +244,6 @@ pub async fn get_default_dataset(config_path: &Path) -> Result<()> {
 ///   - /tmp/file.txt                             (outside ZeroFS, on local filesystem)
 ///   - /home/user/file.txt                       (outside ZeroFS, on local filesystem)
 fn is_internal_zerofs_path(destination_path: &str) -> bool {
-    use std::path::Path;
 
     // For instant restore to work, the destination must be:
     // 1. An absolute path starting with /

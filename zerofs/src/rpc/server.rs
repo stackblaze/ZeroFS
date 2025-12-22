@@ -274,7 +274,6 @@ impl AdminService for AdminRpcServer {
         request: Request<proto::ReadSnapshotFileRequest>,
     ) -> Result<Response<Self::ReadSnapshotFileStream>, Status> {
         use crate::fs::inode::Inode;
-        use crate::fs::permissions::Credentials;
         use tokio_stream::StreamExt;
 
         let req = request.into_inner();
