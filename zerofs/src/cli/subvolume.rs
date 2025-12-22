@@ -229,7 +229,56 @@ pub async fn get_default_subvolume(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Restore a file from a snapshot (instant COW copy)
+/// Check if a path is within a ZeroFS mount point
+/// For internal restore (within ZeroFS filesystem), paths should NOT include external mount points
+/// Examples of INTERNAL paths (use instant restore):
+///   - /file.txt                                  (root of ZeroFS filesystem)
+///   - /data/file.txt                            (subdirectory in ZeroFS)
+///   - /var/lib/kubelet/pods/.../file.txt        (Kubernetes CSI volume path - internal to ZeroFS)
+/// Examples of EXTERNAL paths (use copy-based restore):
+///   - /tmp/file.txt                             (outside ZeroFS, on local filesystem)
+///   - /home/user/file.txt                       (outside ZeroFS, on local filesystem)
+fn is_internal_zerofs_path(destination_path: &str) -> bool {
+    use std::path::Path;
+    
+    // For instant restore to work, the destination must be:
+    // 1. An absolute path starting with /
+    // 2. NOT a path on the local filesystem outside ZeroFS
+    
+    if !destination_path.starts_with('/') {
+        return false;
+    }
+    
+    // Paths that are definitely EXTERNAL (local filesystem):
+    let external_prefixes = [
+        "/tmp/",
+        "/home/",
+        "/root/",
+        "/opt/",
+        "/usr/",
+        "/etc/",
+        "/boot/",
+        "/sys/",
+        "/proc/",
+        "/dev/",
+    ];
+    
+    for prefix in &external_prefixes {
+        if destination_path.starts_with(prefix) {
+            return false; // External path, use copy-based restore
+        }
+    }
+    
+    // All other absolute paths are considered internal to ZeroFS
+    // This includes:
+    // - /file.txt (root of ZeroFS)
+    // - /data/file.txt (ZeroFS subdirectories)
+    // - /mnt/... (if ZeroFS is mounted at /mnt)
+    // - /var/lib/kubelet/... (Kubernetes CSI volumes)
+    true
+}
+
+/// Restore a file from a snapshot (instant COW copy when destination is within ZeroFS)
 pub async fn restore_from_snapshot(
     config_path: &Path,
     snapshot_name: &str,
@@ -255,26 +304,52 @@ pub async fn restore_from_snapshot(
     println!("   Destination: {}", destination_path);
     println!();
     
-    print!("⏳ Reading file from snapshot...");
-    std::io::stdout().flush()?;
+    // Check if destination is internal to ZeroFS filesystem
+    // For Kubernetes CSI, paths will be absolute paths like /var/lib/kubelet/pods/.../volumes/...
+    // For direct use, paths will be like /file.txt or /data/file.txt (relative to ZeroFS root)
+    let use_instant_restore = is_internal_zerofs_path(destination_path);
     
-    // Read the file from the snapshot via RPC
-    let file_data = client.read_snapshot_file(snapshot_name, source_path).await
-        .with_context(|| format!("Failed to read file '{}' from snapshot", source_path))?;
-    
-    println!(" done! ({} bytes)", file_data.len());
-    
-    print!("⏳ Writing to destination...");
-    std::io::stdout().flush()?;
-    
-    // Write to destination
-    fs::write(destination_path, &file_data)
-        .with_context(|| format!("Failed to write to destination '{}'", destination_path))?;
-    
-    println!(" done!");
-    println!();
-    println!("✅ File restored successfully!");
-    println!("   Size: {}", format_size(file_data.len() as u64));
+    if use_instant_restore {
+        // INSTANT RESTORE: Create directory entry pointing to snapshot inode (COW)
+        print!("⚡ Instant restore (COW - no data copying)...");
+        std::io::stdout().flush()?;
+        
+        let (inode_id, file_size, nlink) = client
+            .instant_restore_file(snapshot_name, source_path, destination_path)
+            .await
+            .with_context(|| format!("Failed to instant restore file '{}' from snapshot", source_path))?;
+        
+        println!(" done!");
+        println!();
+        println!("✅ File restored instantly (COW)!");
+        println!("   Inode: {}", inode_id);
+        println!("   Size: {}", format_size(file_size));
+        println!("   Links: {} (shared with snapshot)", nlink);
+        println!("   ⚡ No data copied - instant restore!");
+    } else {
+        // COPY-BASED RESTORE: For external destinations (outside ZeroFS)
+        print!("⏳ Reading file from snapshot...");
+        std::io::stdout().flush()?;
+        
+        // Read the file from the snapshot via RPC
+        let file_data = client.read_snapshot_file(snapshot_name, source_path).await
+            .with_context(|| format!("Failed to read file '{}' from snapshot", source_path))?;
+        
+        println!(" done! ({} bytes)", file_data.len());
+        
+        print!("⏳ Writing to destination...");
+        std::io::stdout().flush()?;
+        
+        // Write to destination
+        fs::write(destination_path, &file_data)
+            .with_context(|| format!("Failed to write to destination '{}'", destination_path))?;
+        
+        println!(" done!");
+        println!();
+        println!("✅ File restored successfully!");
+        println!("   Size: {}", format_size(file_data.len() as u64));
+        println!("   Note: Data copied (destination outside ZeroFS)");
+    }
     
     Ok(())
 }

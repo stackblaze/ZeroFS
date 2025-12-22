@@ -355,6 +355,30 @@ impl RpcClient {
         Ok(file_data)
     }
 
+    /// Instant restore file from snapshot (COW - creates directory entry, no data copying)
+    pub async fn instant_restore_file(
+        &self,
+        snapshot_name: &str,
+        source_path: &str,
+        destination_path: &str,
+    ) -> Result<(u64, u64, u32)> {
+        let request = proto::InstantRestoreFileRequest {
+            snapshot_name: snapshot_name.to_string(),
+            source_path: source_path.to_string(),
+            destination_path: destination_path.to_string(),
+        };
+
+        let response = self
+            .client
+            .clone()
+            .instant_restore_file(request)
+            .await
+            .map_err(|s| anyhow!("Failed to instant restore file: {}", s.message()))?
+            .into_inner();
+
+        Ok((response.inode_id, response.file_size, response.nlink))
+    }
+
     // Convenience method for creating read-write snapshots (default, like btrfs)
     pub async fn create_snapshot(&self, source_name: &str, snapshot_name: &str) -> Result<Subvolume> {
         self.create_snapshot_with_options(source_name, snapshot_name, false).await

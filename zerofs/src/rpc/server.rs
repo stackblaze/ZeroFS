@@ -376,6 +376,125 @@ impl AdminService for AdminRpcServer {
 
         Ok(Response::new(Box::pin(stream) as Self::ReadSnapshotFileStream))
     }
+
+    async fn instant_restore_file(
+        &self,
+        request: Request<proto::InstantRestoreFileRequest>,
+    ) -> Result<Response<proto::InstantRestoreFileResponse>, Status> {
+        use crate::fs::inode::Inode;
+        use crate::fs::types::AuthContext;
+        
+        let req = request.into_inner();
+        let snapshot_name = req.snapshot_name;
+        let source_path = req.source_path;
+        let destination_path = req.destination_path;
+
+        // Get snapshot info
+        let snapshot = self.snapshot_manager
+            .get_subvolume_by_name(&snapshot_name)
+            .await
+            .ok_or_else(|| Status::not_found(format!("Snapshot '{}' not found", snapshot_name)))?;
+
+        if !snapshot.is_snapshot {
+            return Err(Status::invalid_argument(format!("'{}' is not a snapshot", snapshot_name)));
+        }
+
+        // Navigate to source file in snapshot
+        let snapshot_root = snapshot.root_inode;
+        let source_parts: Vec<&str> = source_path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        
+        tracing::info!("Instant restore: snapshot '{}' root inode {}: source={:?}, dest={}", 
+            snapshot_name, snapshot_root, source_parts, destination_path);
+        
+        let mut current_inode = snapshot_root;
+        let fs_ref = self.fs.clone();
+        
+        // Navigate to the source file
+        for part in &source_parts {
+            let inode = fs_ref.inode_store.get(current_inode).await
+                .map_err(|e| Status::internal(format!("Failed to read inode {}: {}", current_inode, e)))?;
+            
+            match inode {
+                Inode::Directory(_) => {
+                    current_inode = fs_ref.directory_store.get(current_inode, part.as_bytes()).await
+                        .map_err(|e| Status::not_found(format!("Path component '{}' not found: {}", part, e)))?;
+                }
+                _ => {
+                    return Err(Status::invalid_argument(format!("'{}' is not a directory", part)));
+                }
+            }
+        }
+
+        // current_inode is now the source file inode
+        let source_file_inode = fs_ref.inode_store.get(current_inode).await
+            .map_err(|e| Status::internal(format!("Failed to read file inode: {}", e)))?;
+
+        let (file_size, file_nlink) = match source_file_inode {
+            Inode::File(file) => (file.size, file.nlink),
+            _ => {
+                return Err(Status::invalid_argument("Source path does not point to a file"));
+            }
+        };
+
+        // Parse destination path to get directory and filename
+        let dest_parts: Vec<&str> = destination_path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        if dest_parts.is_empty() {
+            return Err(Status::invalid_argument("Destination path must include a filename"));
+        }
+
+        let filename = dest_parts.last().unwrap();
+        let dir_parts = &dest_parts[..dest_parts.len() - 1];
+
+        // Navigate to destination directory (start from root subvolume)
+        let root_subvol = self.snapshot_manager.get_subvolume_by_name("root").await
+            .ok_or_else(|| Status::internal("Root subvolume not found"))?;
+        
+        let mut dest_dir_inode = root_subvol.root_inode;
+        
+        for part in dir_parts {
+            let inode = fs_ref.inode_store.get(dest_dir_inode).await
+                .map_err(|e| Status::internal(format!("Failed to read inode {}: {}", dest_dir_inode, e)))?;
+            
+            match inode {
+                Inode::Directory(_) => {
+                    dest_dir_inode = fs_ref.directory_store.get(dest_dir_inode, part.as_bytes()).await
+                        .map_err(|e| Status::not_found(format!("Destination directory component '{}' not found: {}", part, e)))?;
+                }
+                _ => {
+                    return Err(Status::invalid_argument(format!("'{}' is not a directory", part)));
+                }
+            }
+        }
+
+        // Use root auth context for instant restore
+        let auth = AuthContext {
+            uid: 0,
+            gid: 0,
+            gids: vec![],
+        };
+
+        // Create link (directory entry pointing to same inode) - INSTANT COW!
+        fs_ref.link(&auth, current_inode, dest_dir_inode, filename.as_bytes()).await
+            .map_err(|e| Status::internal(format!("Failed to create instant restore link: {}", e)))?;
+
+        // Get updated nlink count
+        let updated_inode = fs_ref.inode_store.get(current_inode).await
+            .map_err(|e| Status::internal(format!("Failed to read updated inode: {}", e)))?;
+        
+        let updated_nlink = match updated_inode {
+            Inode::File(file) => file.nlink,
+            _ => file_nlink + 1,
+        };
+
+        tracing::info!("Instant restore complete: inode {}, size {}, nlink {}", 
+            current_inode, file_size, updated_nlink);
+
+        Ok(Response::new(proto::InstantRestoreFileResponse {
+            inode_id: current_inode,
+            file_size,
+            nlink: updated_nlink,
+        }))
+    }
 }
 
 /// Serve gRPC over TCP
