@@ -809,7 +809,7 @@ pub async fn run_server(
     let snapshot_manager = Arc::new(crate::fs::snapshot_manager::SnapshotManager::new(
         fs.db.clone(),
         fs.inode_store.clone(),
-        fs.dataset_store.clone(),
+        (*fs.dataset_store).clone(),
         fs.directory_store.clone(),
     ));
     

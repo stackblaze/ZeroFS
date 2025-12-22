@@ -6,7 +6,7 @@ use crate::fs::store::{DirectoryStore, InodeStore, DatasetStore};
 use crate::fs::store::directory::DirScanValue;
 use crate::fs::dataset::{Dataset, DatasetId};
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt, pin_mut};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -398,7 +398,7 @@ impl SnapshotManager {
         let mut count = 0;
         const MAX_ENTRIES: usize = 100000; // Safety limit
         
-        let stream = self.dir_store.list_from(source_dir_id, 0).await?;
+        let stream = self.directory_store.list_from(source_dir_id, 0).await?;
         pin_mut!(stream);
         
         while let Some(result) = stream.next().await {

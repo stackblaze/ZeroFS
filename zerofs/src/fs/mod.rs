@@ -20,10 +20,12 @@ use self::flush_coordinator::FlushCoordinator;
 use self::key_codec::KeyCodec;
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
+use self::snapshot_vfs::SnapshotVfs;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
-use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore};
+use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore, DatasetStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
+use self::writeback_cache::WritebackCache;
 use crate::config::CompressionConfig;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
@@ -73,10 +75,11 @@ pub fn get_current_time() -> (u64, u32) {
     (now.as_secs(), now.subsec_nanos())
 }
 
-pub const CHUNK_SIZE: usize = 32 * 1024;
+pub const CHUNK_SIZE: usize = 32 * 1024; // 32KB chunks - matches existing data
 pub const STATS_SHARDS: usize = 100;
 pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
 pub const NAME_MAX: usize = 255;
+pub const ROOT_INODE_ID: InodeId = 0;
 
 pub fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
     if filename.len() > NAME_MAX {
@@ -92,12 +95,16 @@ pub struct ZeroFS {
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
     pub tombstone_store: TombstoneStore,
+    pub dataset_store: Arc<DatasetStore>,
+    pub snapshot_vfs: Arc<SnapshotVfs>,
     pub lock_manager: Arc<LockManager>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub flush_coordinator: FlushCoordinator,
     pub write_coordinator: Arc<WriteCoordinator>,
+    pub writeback_cache: Option<Arc<WritebackCache>>,
     pub max_bytes: u64,
+    pub chunk_size: usize,
     pub tracer: AccessTracer,
 }
 
@@ -187,6 +194,14 @@ impl ZeroFS {
         let directory_store = DirectoryStore::new(db.clone());
         let inode_store = InodeStore::new(db.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone());
+        
+        // Initialize dataset store
+        let (created_sec, _) = get_current_time();
+        let dataset_store = DatasetStore::new(db.clone(), ROOT_INODE_ID, created_sec).await?;
+        let dataset_store_arc = Arc::new(dataset_store.clone());
+        
+        // Initialize snapshot VFS
+        let snapshot_vfs = Arc::new(SnapshotVfs::new(dataset_store));
 
         let fs = Self {
             db: db.clone(),
@@ -194,16 +209,33 @@ impl ZeroFS {
             directory_store,
             inode_store,
             tombstone_store,
+            dataset_store: dataset_store_arc,
+            snapshot_vfs,
             lock_manager,
             stats,
             global_stats,
             flush_coordinator,
             write_coordinator,
+            writeback_cache: None,
             max_bytes,
+            chunk_size: CHUNK_SIZE,
             tracer: AccessTracer::new(),
         };
 
         Ok(fs)
+    }
+
+    /// Get inode with snapshot VFS support
+    /// This method handles virtual .snapshots directory and delegates to inode_store for real inodes
+    pub async fn get_inode(&self, id: InodeId) -> Result<Inode, FsError> {
+        // Handle virtual .snapshots directory
+        if id == snapshot_vfs::SNAPSHOTS_DIR_INODE {
+            let (now_sec, _) = get_current_time();
+            return Ok(self.snapshot_vfs.get_snapshots_dir_inode(now_sec));
+        }
+        
+        // Regular inodes - get from store
+        self.inode_store.get(id).await
     }
 
     pub async fn commit_transaction(
