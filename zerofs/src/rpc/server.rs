@@ -403,14 +403,21 @@ impl AdminService for AdminRpcServer {
         let snapshot_root = snapshot.root_inode;
         let source_parts: Vec<&str> = source_path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
         
+        if source_parts.is_empty() {
+            return Err(Status::invalid_argument("Source path cannot be empty"));
+        }
+        
         tracing::info!("Instant restore: snapshot '{}' root inode {}: source={:?}, dest={}", 
             snapshot_name, snapshot_root, source_parts, destination_path);
         
         let mut current_inode = snapshot_root;
         let fs_ref = self.fs.clone();
         
-        // Navigate to the source file
-        for part in &source_parts {
+        // Navigate to the parent directory (all parts except the last, which is the filename)
+        let dir_parts = &source_parts[0..source_parts.len()-1];
+        let filename = source_parts[source_parts.len()-1];
+        
+        for part in dir_parts {
             let inode = fs_ref.inode_store.get(current_inode).await
                 .map_err(|e| Status::internal(format!("Failed to read inode {}: {}", current_inode, e)))?;
             
@@ -424,6 +431,10 @@ impl AdminService for AdminRpcServer {
                 }
             }
         }
+        
+        // Now look up the filename in the parent directory
+        current_inode = fs_ref.directory_store.get(current_inode, filename.as_bytes()).await
+            .map_err(|e| Status::not_found(format!("File '{}' not found in directory: {}", filename, e)))?;
 
         // current_inode is now the source file inode
         let source_file_inode = fs_ref.inode_store.get(current_inode).await
