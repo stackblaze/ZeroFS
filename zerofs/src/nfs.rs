@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use zerofs_nfsserve::nfs::{ftype3, *};
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{AuthContext as NfsAuthContext, NFSFileSystem, VFSCapabilities};
@@ -211,7 +211,11 @@ impl NFSFileSystem for NFSAdapter {
         let result = self
             .fs
             .readdir(&auth.into(), dirid, start_after, max_entries)
-            .await?;
+            .await
+            .map_err(|e| {
+                error!("readdir error on dir {} start_after {}: {:?}", dirid, start_after, e);
+                e
+            })?;
 
         Ok(zerofs_nfsserve::vfs::ReadDirResult {
             entries: result
