@@ -1,0 +1,235 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for the release'
+        required: true
+        default: 'v0.1.0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Build ${{ matrix.platform }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            os: ubuntu-latest
+            platform: linux
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: armv7-unknown-linux-gnueabihf
+            arch: armv7
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: x86_64-apple-darwin
+            arch: x86_64
+            os: macos-13
+            platform: darwin
+            use_cross: false
+          - target: aarch64-apple-darwin
+            arch: aarch64
+            os: macos-14
+            platform: darwin
+            use_cross: false
+          - target: x86_64-unknown-freebsd
+            arch: amd64
+            os: ubuntu-latest
+            platform: freebsd
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        if: matrix.platform != 'freebsd'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (Linux ARM only)
+        if: matrix.use_cross
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: matrix.use_cross
+        run: |
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable" cross build --release --target ${{ matrix.target }}
+
+      - name: Build with cargo
+        if: matrix.use_cross == false && matrix.platform != 'freebsd'
+        run: |
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable" cargo build --release --target ${{ matrix.target }}
+
+      - name: Build on FreeBSD
+        if: matrix.platform == 'freebsd'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y gmake curl cmake
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          run: |
+            . $HOME/.cargo/env
+            echo "Building ZeroFS for FreeBSD..."
+            cd zerofs
+            RUSTFLAGS="--cfg tokio_unstable" cargo build --release
+            cp target/release/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+            rm -rf target/
+
+      - name: Prepare binary
+        run: |
+          mkdir -p release
+          if [ "${{ matrix.platform }}" = "freebsd" ]; then
+            mv zerofs-${{ matrix.platform }}-${{ matrix.arch }} release/
+          else
+            cp zerofs/target/${{ matrix.target }}/release/zerofs release/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          fi
+          chmod +x release/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          
+          # Create compressed archive
+          cd release
+          tar czf zerofs-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          sha256sum zerofs-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz > zerofs-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz.sha256
+          sha256sum zerofs-${{ matrix.platform }}-${{ matrix.arch }} > zerofs-${{ matrix.platform }}-${{ matrix.arch }}.sha256
+
+      - name: Generate attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: release/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          path: release/*
+          retention-days: 7
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" -o -name "zerofs-*" \) -exec cp {} release/ \;
+          ls -lh release/
+
+      - name: Get tag name
+        id: get_tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag_name=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_tag.outputs.tag_name }}
+          name: ZeroFS ${{ steps.get_tag.outputs.tag_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release/zerofs-linux-amd64.tar.gz
+            release/zerofs-linux-amd64.tar.gz.sha256
+            release/zerofs-linux-arm64.tar.gz
+            release/zerofs-linux-arm64.tar.gz.sha256
+            release/zerofs-linux-armv7.tar.gz
+            release/zerofs-linux-armv7.tar.gz.sha256
+            release/zerofs-darwin-x86_64.tar.gz
+            release/zerofs-darwin-x86_64.tar.gz.sha256
+            release/zerofs-darwin-aarch64.tar.gz
+            release/zerofs-darwin-aarch64.tar.gz.sha256
+            release/zerofs-freebsd-amd64.tar.gz
+            release/zerofs-freebsd-amd64.tar.gz.sha256
+          body: |
+            ## ZeroFS Release ${{ steps.get_tag.outputs.tag_name }}
+            
+            ### Download Instructions
+            
+            **Linux (x86_64):**
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.get_tag.outputs.tag_name }}/zerofs-linux-amd64.tar.gz
+            tar xzf zerofs-linux-amd64.tar.gz
+            chmod +x zerofs-linux-amd64
+            sudo mv zerofs-linux-amd64 /usr/local/bin/zerofs
+            ```
+            
+            **Linux (ARM64):**
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.get_tag.outputs.tag_name }}/zerofs-linux-arm64.tar.gz
+            tar xzf zerofs-linux-arm64.tar.gz
+            chmod +x zerofs-linux-arm64
+            sudo mv zerofs-linux-arm64 /usr/local/bin/zerofs
+            ```
+            
+            **macOS (Intel):**
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.get_tag.outputs.tag_name }}/zerofs-darwin-x86_64.tar.gz
+            tar xzf zerofs-darwin-x86_64.tar.gz
+            chmod +x zerofs-darwin-x86_64
+            sudo mv zerofs-darwin-x86_64 /usr/local/bin/zerofs
+            ```
+            
+            **macOS (Apple Silicon):**
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.get_tag.outputs.tag_name }}/zerofs-darwin-aarch64.tar.gz
+            tar xzf zerofs-darwin-aarch64.tar.gz
+            chmod +x zerofs-darwin-aarch64
+            sudo mv zerofs-darwin-aarch64 /usr/local/bin/zerofs
+            ```
+            
+            **FreeBSD (x86_64):**
+            ```bash
+            fetch https://github.com/${{ github.repository }}/releases/download/${{ steps.get_tag.outputs.tag_name }}/zerofs-freebsd-amd64.tar.gz
+            tar xzf zerofs-freebsd-amd64.tar.gz
+            chmod +x zerofs-freebsd-amd64
+            sudo mv zerofs-freebsd-amd64 /usr/local/bin/zerofs
+            ```
+            
+            ### Verify Checksums
+            
+            Download the `.sha256` file and verify:
+            ```bash
+            sha256sum -c zerofs-linux-amd64.tar.gz.sha256
+            ```
+            
+            ### What's New
+            
+            See the full changelog below.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
