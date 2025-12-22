@@ -3,6 +3,7 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, Inode, InodeId};
 use crate::fs::key_codec::{KeyCodec, ParsedKey};
 use crate::fs::store::{DirectoryStore, InodeStore, DatasetStore};
+use crate::fs::store::directory::DirScanValue;
 use crate::fs::dataset::{Dataset, DatasetId};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -114,10 +115,11 @@ impl SnapshotManager {
         .map_err(|_| FsError::IoError)?;
 
         let scan_key = KeyCodec::dir_scan_key(root_dir_inode, cookie);
-        let scan_value = KeyCodec::encode_dir_scan_value(SNAPSHOTS_ROOT_INODE, b"snapshots");
+        let scan_value = DirScanValue::Reference { inode_id: SNAPSHOTS_ROOT_INODE };
+        let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
         self.db.put_with_options(
             &scan_key,
-            &scan_value,
+            &scan_value_bytes,
             &slatedb::config::PutOptions::default(),
             &slatedb::config::WriteOptions { await_durable: false }
         )
@@ -191,10 +193,11 @@ impl SnapshotManager {
         .map_err(|_| FsError::IoError)?;
 
         let scan_key = KeyCodec::dir_scan_key(SNAPSHOTS_ROOT_INODE, cookie);
-        let scan_value = KeyCodec::encode_dir_scan_value(snapshot_root_inode, snapshot_name.as_bytes());
+        let scan_value = DirScanValue::Reference { inode_id: snapshot_root_inode };
+        let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
         self.db.put_with_options(
             &scan_key,
-            &scan_value,
+            &scan_value_bytes,
             &slatedb::config::PutOptions::default(),
             &slatedb::config::WriteOptions { await_durable: false }
         )
@@ -390,43 +393,22 @@ impl SnapshotManager {
         source_dir_id: InodeId,
         dest_dir_id: InodeId,
     ) -> Result<(), FsError> {
-        // Get all entries from source directory using range scan
-        // This properly handles non-sequential cookies (e.g., after deletions)
-        let mut entries = vec![];
-        
-        let start_key = Bytes::from(KeyCodec::dir_scan_prefix(source_dir_id));
-        let end_key = KeyCodec::dir_scan_end_key(source_dir_id);
-        
-        let mut iter = self
-            .db
-            .scan(start_key..end_key)
-            .await
-            .map_err(|_| FsError::IoError)?;
-        
-        // Iterate through all entries in the directory
+        // Use DirectoryStore to iterate through entries
+        let mut entries: Vec<(Vec<u8>, InodeId, u64)> = vec![];
         let mut count = 0;
         const MAX_ENTRIES: usize = 100000; // Safety limit
         
-        while let Some(result) = iter.next().await {
+        let stream = self.dir_store.list_from(source_dir_id, 0).await?;
+        pin_mut!(stream);
+        
+        while let Some(result) = stream.next().await {
             if count >= MAX_ENTRIES {
                 tracing::error!("Directory {} has more than {} entries - aborting clone", source_dir_id, MAX_ENTRIES);
                 return Err(FsError::IoError);
             }
             
-            let (key, value) = result.map_err(|_| FsError::IoError)?;
-            
-            // Parse cookie from key
-            let cookie = match KeyCodec::parse_key(&key) {
-                ParsedKey::DirScan { cookie } => cookie,
-                _ => {
-                    tracing::warn!("Unexpected key type in directory scan for inode {}", source_dir_id);
-                    continue;
-                }
-            };
-            
-            // Decode entry value to get (inode_id, name)
-            let (inode_id, name) = KeyCodec::decode_dir_scan_value(&value)?;
-            entries.push((name, inode_id, cookie));
+            let entry = result?;
+            entries.push((entry.name.clone(), entry.inode_id, entry.cookie));
             count += 1;
             
             if count % 100 == 0 {
@@ -456,10 +438,11 @@ impl SnapshotManager {
 
             // Create dir_scan key for destination
             let scan_key = KeyCodec::dir_scan_key(dest_dir_id, cookie);
-            let scan_value = KeyCodec::encode_dir_scan_value(inode_id, &name);
+            let scan_value = DirScanValue::Reference { inode_id };
+            let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
             self.db.put_with_options(
                 &scan_key,
-                &scan_value,
+                &scan_value_bytes,
                 &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions { await_durable: false }
             )

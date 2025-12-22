@@ -11,6 +11,10 @@ pub mod store;
 pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
+pub mod dataset;
+pub mod snapshot_manager;
+pub mod snapshot_vfs;
+pub mod writeback_cache;
 
 use self::flush_coordinator::FlushCoordinator;
 use self::key_codec::KeyCodec;

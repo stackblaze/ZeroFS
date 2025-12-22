@@ -156,6 +156,8 @@ impl WritebackCache {
             // Write batch to SlateDB
             db.write_raw_batch(
                 cached.batch,
+                Vec::new(), // pending_operations - empty for writeback cache
+                Vec::new(), // deleted_keys - empty for writeback cache
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
