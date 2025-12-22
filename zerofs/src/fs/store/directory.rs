@@ -57,17 +57,33 @@ fn encode_dir_scan_value(name: &[u8], value: &DirScanValue) -> Bytes {
 
 /// Decode directory scan entry value: returns (name, DirScanValue)
 fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsError> {
-    if data.len() < 4 {
-        return Err(FsError::InvalidData);
+    // Try new format first (name_len u32 + name + DirScanValue)
+    if data.len() >= 4 {
+        let name_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        if data.len() >= 4 + name_len {
+            let name = data[4..4 + name_len].to_vec();
+            let value_data = &data[4 + name_len..];
+            
+            // Try to deserialize as DirScanValue enum
+            if let Ok(value) = bincode::deserialize::<DirScanValue>(value_data) {
+                return Ok((name, value));
+            }
+        }
     }
-    let name_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-    if data.len() < 4 + name_len {
-        return Err(FsError::InvalidData);
+    
+    // Fall back to legacy format (inode_id u64 + name)
+    if data.len() >= 8 {
+        let inode_id = u64::from_le_bytes(data[..8].try_into().unwrap());
+        let name = data[8..].to_vec();
+        warn!(
+            "Reading directory entry '{}' in legacy format (inode_id={}), will be upgraded on next write", 
+            String::from_utf8_lossy(&name), inode_id
+        );
+        return Ok((name, DirScanValue::Reference { inode_id }));
     }
-    let name = data[4..4 + name_len].to_vec();
-    let value: DirScanValue =
-        bincode::deserialize(&data[4 + name_len..]).map_err(|_| FsError::InvalidData)?;
-    Ok((name, value))
+    
+    warn!("decode_dir_scan_value: invalid data format (len={})", data.len());
+    Err(FsError::InvalidData)
 }
 
 #[derive(Debug, Clone)]
