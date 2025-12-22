@@ -70,7 +70,7 @@ pub fn get_current_time() -> (u64, u32) {
     (now.as_secs(), now.subsec_nanos())
 }
 
-pub const CHUNK_SIZE: usize = 32 * 1024;
+pub const CHUNK_SIZE: usize = 32 * 1024; // 32KB chunks - matches existing data
 pub const STATS_SHARDS: usize = 100;
 pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
 pub const NAME_MAX: usize = 255;
@@ -98,6 +98,7 @@ pub struct ZeroFS {
     pub write_coordinator: Arc<WriteCoordinator>,
     pub writeback_cache: Option<Arc<WritebackCache>>,
     pub max_bytes: u64,
+    pub chunk_size: usize,
     pub tracer: AccessTracer,
 }
 
@@ -207,6 +208,7 @@ impl ZeroFS {
             write_coordinator,
             writeback_cache: None,
             max_bytes,
+            chunk_size: CHUNK_SIZE,
             tracer: AccessTracer::new(),
         };
 
@@ -218,19 +220,32 @@ impl ZeroFS {
         mut txn: EncryptedTransaction,
         seq_guard: &mut SequenceGuard,
     ) -> Result<(), FsError> {
+        self.commit_transaction_internal(txn, seq_guard, false).await
+    }
+
+    /// Commit transaction with optional immediate flush bypass for writeback cache
+    /// When bypass_cache=true, writes directly to SlateDB even if writeback cache is enabled
+    pub async fn commit_transaction_internal(
+        &self,
+        mut txn: EncryptedTransaction,
+        seq_guard: &mut SequenceGuard,
+        bypass_cache: bool,
+    ) -> Result<(), FsError> {
         self.inode_store.save_counter(&mut txn);
 
         let (encrypt_result, _) = tokio::join!(txn.into_inner(), seq_guard.wait_for_predecessors());
         let (inner_batch, _cache_ops) = encrypt_result.map_err(|_| FsError::IoError)?;
 
-        // If writeback cache is enabled, write to cache instead of directly to SlateDB
-        if let Some(wb_cache) = &self.writeback_cache {
-            wb_cache.write(inner_batch).await?;
-            seq_guard.mark_committed();
-            return Ok(());
+        // If writeback cache is enabled AND we're not bypassing it, write to cache
+        if !bypass_cache {
+            if let Some(wb_cache) = &self.writeback_cache {
+                wb_cache.write(inner_batch).await?;
+                seq_guard.mark_committed();
+                return Ok(());
+            }
         }
 
-        // Default path: write directly to SlateDB
+        // Default path or bypass: write directly to SlateDB
         self.db
             .write_raw_batch(
                 inner_batch,
@@ -653,7 +668,8 @@ impl ZeroFS {
                     .add_to_transaction(&stats_update, &mut txn)?;
 
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
-                self.commit_transaction(txn, &mut seq_guard)
+                // Bypass writeback cache for create operations to ensure immediate visibility
+                self.commit_transaction_internal(txn, &mut seq_guard, true)
                     .await
                     .inspect_err(|e| {
                         error!("Failed to write batch: {:?}", e);
@@ -1101,7 +1117,8 @@ impl ZeroFS {
                     .add_to_transaction(&stats_update, &mut txn)?;
 
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
-                self.commit_transaction(txn, &mut seq_guard).await?;
+                // Bypass writeback cache for mkdir to ensure immediate visibility
+                self.commit_transaction_internal(txn, &mut seq_guard, true).await?;
 
                 self.global_stats.commit_update(&stats_update);
 
@@ -1242,6 +1259,11 @@ impl ZeroFS {
                         break;
                     }
                     let entry = result?;
+                    // Filter out /snapshots entry in root directory - users should use .snapshots instead
+                    if dirid == 0 && entry.name == b"snapshots" {
+                        debug!("readdir: filtering out /snapshots entry (use .snapshots instead)");
+                        continue;
+                    }
                     dir_entries.push((entry.inode_id, entry.name, entry.cookie));
                 }
 
@@ -1257,9 +1279,11 @@ impl ZeroFS {
                                 Ok(None)
                             }
                             Err(e) => {
-                                // Propagate actual errors (IO, corruption, etc.)
-                                error!("readdir: failed to load inode {}: {:?}", inode_id, e);
-                                Err(e)
+                                // Skip entries that fail to load (e.g., corrupted or inaccessible inodes)
+                                // This prevents a single bad entry from breaking the entire directory listing
+                                error!("readdir: failed to load inode {} (name: {:?}): {:?}, skipping", 
+                                    inode_id, String::from_utf8_lossy(&name), e);
+                                Ok(None)
                             }
                         }
                     },
