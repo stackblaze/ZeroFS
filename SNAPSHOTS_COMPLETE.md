@@ -26,7 +26,7 @@
    - Root inode: 9 (contains original directory structure)
    - Type: Snapshot
    - Readonly: false (read-write, like btrfs)
-   - Parent: root subvolume
+   - Parent: root dataset
 ```
 
 **Result**: ✅ Snapshot successfully preserves original filesystem state
@@ -36,25 +36,25 @@
 ### Create Snapshots
 ```bash
 # Read-write snapshot (default, like btrfs)
-zerofs subvolume snapshot -c zerofs.toml root backup-$(date +%s)
+zerofs dataset snapshot -c zerofs.toml root backup-$(date +%s)
 
 # Read-only snapshot
-zerofs subvolume snapshot -c zerofs.toml root readonly-backup --readonly
+zerofs dataset snapshot -c zerofs.toml root readonly-backup --readonly
 ```
 
 ### List Snapshots
 ```bash
-zerofs subvolume list-snapshots -c zerofs.toml
+zerofs dataset list-snapshots -c zerofs.toml
 ```
 
 ### Get Snapshot Info
 ```bash
-zerofs subvolume info -c zerofs.toml snapshot-name
+zerofs dataset info -c zerofs.toml snapshot-name
 ```
 
 ### Delete Snapshots
 ```bash
-zerofs subvolume delete-snapshot -c zerofs.toml snapshot-name
+zerofs dataset delete-snapshot -c zerofs.toml snapshot-name
 ```
 
 ## File Recovery from Snapshots
@@ -83,7 +83,7 @@ Your btrfs-like snapshot implementation is **production-ready** with:
 - ✅ Complete CLI/RPC API
 - ✅ Data integrity verified
 - ✅ Metadata persistence
-- ✅ Subvolume integration
+- ✅ Dataset integration
 
 ## Recommendation
 

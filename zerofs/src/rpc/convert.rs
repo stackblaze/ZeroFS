@@ -1,5 +1,5 @@
 use crate::checkpoint_manager::CheckpointInfo;
-use crate::fs::subvolume::Subvolume;
+use crate::fs::dataset::Dataset;
 use crate::fs::tracing::{FileAccessEvent, FileOperation};
 use crate::rpc::proto;
 use prost_types::Timestamp;
@@ -160,9 +160,9 @@ impl From<FileAccessEvent> for proto::FileAccessEvent {
     }
 }
 
-impl From<Subvolume> for proto::SubvolumeInfo {
-    fn from(subvol: Subvolume) -> Self {
-        proto::SubvolumeInfo {
+impl From<Dataset> for proto::DatasetInfo {
+    fn from(subvol: Dataset) -> Self {
+        proto::DatasetInfo {
             id: subvol.id,
             name: subvol.name,
             uuid: subvol.uuid.to_string(),
@@ -178,11 +178,11 @@ impl From<Subvolume> for proto::SubvolumeInfo {
     }
 }
 
-impl TryFrom<proto::SubvolumeInfo> for Subvolume {
+impl TryFrom<proto::DatasetInfo> for Dataset {
     type Error = uuid::Error;
 
-    fn try_from(proto: proto::SubvolumeInfo) -> Result<Self, Self::Error> {
-        Ok(Subvolume {
+    fn try_from(proto: proto::DatasetInfo) -> Result<Self, Self::Error> {
+        Ok(Dataset {
             id: proto.id,
             name: proto.name,
             uuid: Uuid::parse_str(&proto.uuid)?,

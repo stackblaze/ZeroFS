@@ -10,7 +10,7 @@ pub mod snapshot_manager;
 pub mod snapshot_vfs;
 pub mod stats;
 pub mod store;
-pub mod subvolume;
+pub mod dataset;
 pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
@@ -23,7 +23,7 @@ use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::snapshot_vfs::SnapshotVfs;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
-use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore, SubvolumeStore};
+use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore, DatasetStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
@@ -87,7 +87,7 @@ pub struct ZeroFS {
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
     pub tombstone_store: TombstoneStore,
-    pub subvolume_store: SubvolumeStore,
+    pub dataset_store: DatasetStore,
     pub snapshot_vfs: SnapshotVfs,
     pub lock_manager: Arc<LockManager>,
     pub stats: Arc<FileSystemStats>,
@@ -184,10 +184,10 @@ impl ZeroFS {
         let inode_store = InodeStore::new(db.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone());
         
-        // Get current time for subvolume initialization
+        // Get current time for dataset initialization
         let (now_sec, _) = get_current_time();
-        let subvolume_store = SubvolumeStore::new(db.clone(), 0, now_sec).await?;
-        let snapshot_vfs = SnapshotVfs::new(subvolume_store.clone());
+        let dataset_store = DatasetStore::new(db.clone(), 0, now_sec).await?;
+        let snapshot_vfs = SnapshotVfs::new(dataset_store.clone());
 
         let fs = Self {
             db: db.clone(),
@@ -195,7 +195,7 @@ impl ZeroFS {
             directory_store,
             inode_store,
             tombstone_store,
-            subvolume_store,
+            dataset_store,
             snapshot_vfs,
             lock_manager,
             stats,
@@ -982,7 +982,7 @@ impl ZeroFS {
         // For snapshot directories, check if the snapshot is readonly
         if SnapshotVfs::is_snapshot_dir(dirid) {
             if let Some(snapshot_id) = SnapshotVfs::snapshot_id_from_inode(dirid) {
-                if let Some(snapshot) = self.subvolume_store.get_by_id(snapshot_id).await {
+                if let Some(snapshot) = self.dataset_store.get_by_id(snapshot_id).await {
                     if snapshot.is_readonly {
                         return Err(FsError::ReadOnlyFilesystem);
                     }

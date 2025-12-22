@@ -43,28 +43,28 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Create a new subvolume
-pub async fn create_subvolume(config_path: &Path, name: &str) -> Result<()> {
+/// Create a new dataset
+pub async fn create_dataset(config_path: &Path, name: &str) -> Result<()> {
     let client = connect_rpc_client(config_path).await?;
-    let subvolume = client.create_subvolume(name).await?;
+    let dataset = client.create_dataset(name).await?;
 
-    println!("✓ Subvolume created successfully!");
-    println!("  Name: {}", subvolume.name);
-    println!("  ID: {}", subvolume.id);
-    println!("  UUID: {}", subvolume.uuid);
-    println!("  Created at: {}", format_timestamp(subvolume.created_at));
-    println!("  Root inode: {}", subvolume.root_inode);
+    println!("✓ Dataset created successfully!");
+    println!("  Name: {}", dataset.name);
+    println!("  ID: {}", dataset.id);
+    println!("  UUID: {}", dataset.uuid);
+    println!("  Created at: {}", format_timestamp(dataset.created_at));
+    println!("  Root inode: {}", dataset.root_inode);
 
     Ok(())
 }
 
-/// List all subvolumes
-pub async fn list_subvolumes(config_path: &Path) -> Result<()> {
+/// List all datasets
+pub async fn list_datasets(config_path: &Path) -> Result<()> {
     let client = connect_rpc_client(config_path).await?;
-    let subvolumes = client.list_subvolumes().await?;
+    let datasets = client.list_datasets().await?;
 
-    if subvolumes.is_empty() {
-        println!("No subvolumes found.");
+    if datasets.is_empty() {
+        println!("No datasets found.");
         return Ok(());
     }
 
@@ -79,11 +79,11 @@ pub async fn list_subvolumes(config_path: &Path) -> Result<()> {
         "Readonly",
     ]);
 
-    for subvol in subvolumes {
+    for subvol in datasets {
         let sv_type = if subvol.is_snapshot {
             "Snapshot"
         } else {
-            "Subvolume"
+            "Dataset"
         };
         
         table.add_row(vec![
@@ -100,38 +100,38 @@ pub async fn list_subvolumes(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Delete a subvolume
-pub async fn delete_subvolume(config_path: &Path, name: &str) -> Result<()> {
+/// Delete a dataset
+pub async fn delete_dataset(config_path: &Path, name: &str) -> Result<()> {
     let client = connect_rpc_client(config_path).await?;
-    client.delete_subvolume(name).await?;
+    client.delete_dataset(name).await?;
 
-    println!("✓ Subvolume '{}' deleted successfully!", name);
+    println!("✓ Dataset '{}' deleted successfully!", name);
     Ok(())
 }
 
-/// Get subvolume info
-pub async fn get_subvolume_info(config_path: &Path, name: &str) -> Result<()> {
+/// Get dataset info
+pub async fn get_dataset_info(config_path: &Path, name: &str) -> Result<()> {
     let client = connect_rpc_client(config_path).await?;
-    let subvolume = client
-        .get_subvolume_info(name)
+    let dataset = client
+        .get_dataset_info(name)
         .await?
-        .context("Subvolume not found")?;
+        .context("Dataset not found")?;
 
-    println!("Subvolume Information:");
-    println!("  Name: {}", subvolume.name);
-    println!("  ID: {}", subvolume.id);
-    println!("  UUID: {}", subvolume.uuid);
-    println!("  Type: {}", if subvolume.is_snapshot { "Snapshot" } else { "Subvolume" });
-    println!("  Readonly: {}", subvolume.is_readonly);
-    println!("  Created at: {}", format_timestamp(subvolume.created_at));
-    println!("  Root inode: {}", subvolume.root_inode);
-    println!("  Generation: {}", subvolume.generation);
+    println!("Dataset Information:");
+    println!("  Name: {}", dataset.name);
+    println!("  ID: {}", dataset.id);
+    println!("  UUID: {}", dataset.uuid);
+    println!("  Type: {}", if dataset.is_snapshot { "Snapshot" } else { "Dataset" });
+    println!("  Readonly: {}", dataset.is_readonly);
+    println!("  Created at: {}", format_timestamp(dataset.created_at));
+    println!("  Root inode: {}", dataset.root_inode);
+    println!("  Generation: {}", dataset.generation);
     
-    if let Some(parent_id) = subvolume.parent_id {
+    if let Some(parent_id) = dataset.parent_id {
         println!("  Parent ID: {}", parent_id);
     }
     
-    if let Some(parent_uuid) = subvolume.parent_uuid {
+    if let Some(parent_uuid) = dataset.parent_uuid {
         println!("  Parent UUID: {}", parent_uuid);
     }
 
@@ -167,9 +167,9 @@ pub async fn list_snapshots(config_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Get all subvolumes to map IDs to names
-    let subvolumes = client.list_subvolumes().await?;
-    let mut id_to_name: std::collections::HashMap<u64, String> = subvolumes
+    // Get all datasets to map IDs to names
+    let datasets = client.list_datasets().await?;
+    let mut id_to_name: std::collections::HashMap<u64, String> = datasets
         .into_iter()
         .map(|s| (s.id, s.name))
         .collect();
@@ -211,21 +211,21 @@ pub async fn delete_snapshot(config_path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Set default subvolume
-pub async fn set_default_subvolume(config_path: &Path, name: &str) -> Result<()> {
+/// Set default dataset
+pub async fn set_default_dataset(config_path: &Path, name: &str) -> Result<()> {
     let client = connect_rpc_client(config_path).await?;
-    client.set_default_subvolume(name).await?;
+    client.set_default_dataset(name).await?;
 
-    println!("✓ Default subvolume set to '{}'", name);
+    println!("✓ Default dataset set to '{}'", name);
     Ok(())
 }
 
-/// Get default subvolume
-pub async fn get_default_subvolume(config_path: &Path) -> Result<()> {
+/// Get default dataset
+pub async fn get_default_dataset(config_path: &Path) -> Result<()> {
     let client = connect_rpc_client(config_path).await?;
-    let default_id = client.get_default_subvolume().await?;
+    let default_id = client.get_default_dataset().await?;
 
-    println!("Default subvolume ID: {}", default_id);
+    println!("Default dataset ID: {}", default_id);
     Ok(())
 }
 
@@ -291,7 +291,7 @@ pub async fn restore_from_snapshot(
     let client = connect_rpc_client(config_path).await?;
     
     // Get snapshot info to verify it exists
-    let snapshot = client.get_subvolume_info(snapshot_name).await?
+    let snapshot = client.get_dataset_info(snapshot_name).await?
         .ok_or_else(|| anyhow::anyhow!("Snapshot '{}' not found", snapshot_name))?;
     
     if !snapshot.is_snapshot {

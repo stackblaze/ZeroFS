@@ -7,7 +7,7 @@ pub mod fatrace;
 pub mod nbd;
 pub mod password;
 pub mod server;
-pub mod subvolume;
+pub mod dataset;
 
 #[derive(Parser)]
 #[command(name = "zerofs")]
@@ -61,10 +61,10 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: NbdCommands,
     },
-    /// Subvolume and snapshot management commands
-    Subvolume {
+    /// Dataset and snapshot management commands
+    Dataset {
         #[command(subcommand)]
-        subcommand: SubvolumeCommands,
+        subcommand: DatasetCommands,
     },
     /// Trace file system operations in real-time
     Fatrace {
@@ -259,38 +259,38 @@ pub enum NbdCommands {
 }
 
 #[derive(Subcommand)]
-pub enum SubvolumeCommands {
-    /// Create a new subvolume
+pub enum DatasetCommands {
+    /// Create a new dataset
     Create {
         #[arg(short, long)]
         config: PathBuf,
-        /// Subvolume name (must be unique)
+        /// Dataset name (must be unique)
         name: String,
     },
-    /// List all subvolumes
+    /// List all datasets
     List {
         #[arg(short, long)]
         config: PathBuf,
     },
-    /// Delete a subvolume
+    /// Delete a dataset
     Delete {
         #[arg(short, long)]
         config: PathBuf,
-        /// Subvolume name to delete
+        /// Dataset name to delete
         name: String,
     },
-    /// Get subvolume information
+    /// Get dataset information
     Info {
         #[arg(short, long)]
         config: PathBuf,
-        /// Subvolume name to query
+        /// Dataset name to query
         name: String,
     },
-    /// Create a snapshot of a subvolume
+    /// Create a snapshot of a dataset
     Snapshot {
         #[arg(short, long)]
         config: PathBuf,
-        /// Source subvolume name
+        /// Source dataset name
         source: String,
         /// Snapshot name (must be unique)
         name: String,
@@ -310,14 +310,14 @@ pub enum SubvolumeCommands {
         /// Snapshot name to delete
         name: String,
     },
-    /// Set the default subvolume
+    /// Set the default dataset
     SetDefault {
         #[arg(short, long)]
         config: PathBuf,
-        /// Subvolume name to set as default
+        /// Dataset name to set as default
         name: String,
     },
-    /// Get the default subvolume
+    /// Get the default dataset
     GetDefault {
         #[arg(short, long)]
         config: PathBuf,

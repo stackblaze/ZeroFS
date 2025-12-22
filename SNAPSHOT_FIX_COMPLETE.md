@@ -47,7 +47,7 @@ Changed all `await_durable` flags from `true` to `false` in:
 
 ### Performance
 ```bash
-$ time zerofs subvolume snapshot -c zerofs.toml root FAST-TEST-$(date +%s)
+$ time zerofs dataset snapshot -c zerofs.toml root FAST-TEST-$(date +%s)
 ✓ Snapshot created successfully!
 real    0m0.140s  ← FAST!
 ```
@@ -64,7 +64,7 @@ All entries from root inode 0 were correctly cloned!
 
 ### Restore Verification
 ```bash
-$ zerofs subvolume restore --snapshot FAST-TEST-1766338689 --source .nbd --destination /tmp/test
+$ zerofs dataset restore --snapshot FAST-TEST-1766338689 --source .nbd --destination /tmp/test
 Error: Path does not point to a file  ← CORRECT (it's a directory)
 ```
 

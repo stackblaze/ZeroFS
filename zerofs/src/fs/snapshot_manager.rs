@@ -2,8 +2,8 @@ use crate::encryption::EncryptedDb;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, Inode, InodeId};
 use crate::fs::key_codec::{KeyCodec, ParsedKey};
-use crate::fs::store::{DirectoryStore, InodeStore, SubvolumeStore};
-use crate::fs::subvolume::{Subvolume, SubvolumeId};
+use crate::fs::store::{DirectoryStore, InodeStore, DatasetStore};
+use crate::fs::dataset::{Dataset, DatasetId};
 use bytes::Bytes;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ pub const SNAPSHOTS_ROOT_INODE: InodeId = 0xFFFFFFFF00000001;
 pub struct SnapshotManager {
     db: Arc<EncryptedDb>,
     inode_store: InodeStore,
-    subvolume_store: SubvolumeStore,
+    dataset_store: DatasetStore,
     directory_store: DirectoryStore,
 }
 
@@ -31,13 +31,13 @@ impl SnapshotManager {
     pub fn new(
         db: Arc<EncryptedDb>,
         inode_store: InodeStore,
-        subvolume_store: SubvolumeStore,
+        dataset_store: DatasetStore,
         directory_store: DirectoryStore,
     ) -> Self {
         Self {
             db,
             inode_store,
-            subvolume_store,
+            dataset_store,
             directory_store,
         }
     }
@@ -230,59 +230,59 @@ impl SnapshotManager {
         self.inode_store.allocate()
     }
 
-    /// Create a new subvolume
-    pub async fn create_subvolume(
+    /// Create a new dataset
+    pub async fn create_dataset(
         &self,
         name: String,
         root_inode: InodeId,
         created_at: u64,
         is_readonly: bool,
-    ) -> Result<Subvolume, FsError> {
-        self.subvolume_store.create_subvolume(name, root_inode, created_at, is_readonly).await
+    ) -> Result<Dataset, FsError> {
+        self.dataset_store.create_dataset(name, root_inode, created_at, is_readonly).await
     }
 
-    /// List all subvolumes
-    pub async fn list_subvolumes(&self) -> Vec<Subvolume> {
-        self.subvolume_store.list_subvolumes().await
+    /// List all datasets
+    pub async fn list_datasets(&self) -> Vec<Dataset> {
+        self.dataset_store.list_datasets().await
     }
 
-    /// Get subvolume by name
-    pub async fn get_subvolume_by_name(&self, name: &str) -> Option<Subvolume> {
-        self.subvolume_store.get_by_name(name).await
+    /// Get dataset by name
+    pub async fn get_dataset_by_name(&self, name: &str) -> Option<Dataset> {
+        self.dataset_store.get_by_name(name).await
     }
 
-    /// Delete subvolume by name
-    pub async fn delete_subvolume(&self, name: &str) -> Result<(), FsError> {
-        // Get the subvolume by name
-        let subvolume = self.subvolume_store.get_by_name(name).await
+    /// Delete dataset by name
+    pub async fn delete_dataset(&self, name: &str) -> Result<(), FsError> {
+        // Get the dataset by name
+        let dataset = self.dataset_store.get_by_name(name).await
             .ok_or(FsError::NotFound)?;
         
-        self.subvolume_store.delete_subvolume(subvolume.id).await?;
+        self.dataset_store.delete_dataset(dataset.id).await?;
         Ok(())
     }
 
-    /// Set default subvolume by name
-    pub async fn set_default_subvolume(&self, name: &str) -> Result<(), FsError> {
-        let subvolume = self.subvolume_store.get_by_name(name).await
+    /// Set default dataset by name
+    pub async fn set_default_dataset(&self, name: &str) -> Result<(), FsError> {
+        let dataset = self.dataset_store.get_by_name(name).await
             .ok_or(FsError::NotFound)?;
         
-        self.subvolume_store.set_default(subvolume.id).await
+        self.dataset_store.set_default(dataset.id).await
     }
 
-    /// Get default subvolume ID
-    pub async fn get_default_subvolume(&self) -> SubvolumeId {
-        self.subvolume_store.get_default().await
+    /// Get default dataset ID
+    pub async fn get_default_dataset(&self) -> DatasetId {
+        self.dataset_store.get_default().await
     }
 
-    /// Create a snapshot by subvolume name
+    /// Create a snapshot by dataset name
     pub async fn create_snapshot_by_name(
         &self,
         source_name: &str,
         snapshot_name: String,
         created_at: u64,
         is_readonly: bool,
-    ) -> Result<Subvolume, FsError> {
-        let source = self.subvolume_store.get_by_name(source_name).await
+    ) -> Result<Dataset, FsError> {
+        let source = self.dataset_store.get_by_name(source_name).await
             .ok_or(FsError::NotFound)?;
         
         self.create_snapshot(source.id, snapshot_name, created_at, is_readonly).await
@@ -290,7 +290,7 @@ impl SnapshotManager {
 
     /// Delete snapshot by name
     pub async fn delete_snapshot_by_name(&self, name: &str) -> Result<(), FsError> {
-        let snapshot = self.subvolume_store.get_by_name(name).await
+        let snapshot = self.dataset_store.get_by_name(name).await
             .ok_or(FsError::NotFound)?;
         
         if !snapshot.is_snapshot {
@@ -300,26 +300,26 @@ impl SnapshotManager {
         self.delete_snapshot(snapshot.id).await
     }
 
-    /// Create a snapshot of a subvolume
+    /// Create a snapshot of a dataset
     /// This creates a COW snapshot by cloning the root directory inode
     /// The actual data chunks are shared until modified (copy-on-write)
     /// Also creates a real directory entry at /snapshots/<name>/ for NFS access
     pub async fn create_snapshot(
         &self,
-        source_id: SubvolumeId,
+        source_id: DatasetId,
         snapshot_name: String,
         created_at: u64,
         is_readonly: bool,
-    ) -> Result<Subvolume, FsError> {
+    ) -> Result<Dataset, FsError> {
         if self.db.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem);
         }
 
-        // Get the source subvolume
-        let source = self.subvolume_store.get_by_id(source_id).await
+        // Get the source dataset
+        let source = self.dataset_store.get_by_id(source_id).await
             .ok_or(FsError::NotFound)?;
 
-        // Clone the root inode of the source subvolume
+        // Clone the root inode of the source dataset
         let source_root_inode = self.inode_store.get(source.root_inode).await?;
         
         // Create a new inode for the snapshot root
@@ -363,8 +363,8 @@ impl SnapshotManager {
         .await
         .map_err(|_| FsError::IoError)?;
 
-        // Create the snapshot metadata in subvolume store
-        let snapshot = self.subvolume_store
+        // Create the snapshot metadata in dataset store
+        let snapshot = self.dataset_store
             .create_snapshot(source_id, snapshot_name.clone(), snapshot_root_id, created_at, is_readonly)
             .await?;
 
@@ -544,13 +544,13 @@ impl SnapshotManager {
 
     /// Delete a snapshot
     /// This decrements reference counts on all inodes in the snapshot
-    pub async fn delete_snapshot(&self, snapshot_id: SubvolumeId) -> Result<(), FsError> {
+    pub async fn delete_snapshot(&self, snapshot_id: DatasetId) -> Result<(), FsError> {
         if self.db.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem);
         }
 
         // Get the snapshot
-        let snapshot = self.subvolume_store.get_by_id(snapshot_id).await
+        let snapshot = self.dataset_store.get_by_id(snapshot_id).await
             .ok_or(FsError::NotFound)?;
 
         if !snapshot.is_snapshot {
@@ -559,19 +559,19 @@ impl SnapshotManager {
 
         // TODO: Implement recursive deletion of snapshot tree
         // For now, just remove it from the registry
-        self.subvolume_store.delete_subvolume(snapshot_id).await?;
+        self.dataset_store.delete_dataset(snapshot_id).await?;
 
         Ok(())
     }
 
     /// List all snapshots
-    pub async fn list_snapshots(&self) -> Vec<Subvolume> {
-        self.subvolume_store.list_snapshots().await
+    pub async fn list_snapshots(&self) -> Vec<Dataset> {
+        self.dataset_store.list_snapshots().await
     }
 
     /// Get snapshot info
-    pub async fn get_snapshot(&self, snapshot_id: SubvolumeId) -> Option<Subvolume> {
-        self.subvolume_store.get_by_id(snapshot_id).await
+    pub async fn get_snapshot(&self, snapshot_id: DatasetId) -> Option<Dataset> {
+        self.dataset_store.get_by_id(snapshot_id).await
     }
 }
 
@@ -590,10 +590,10 @@ mod tests {
         let snapshot_manager = SnapshotManager::new(
             fs.db.clone(),
             fs.inode_store.clone(),
-            fs.subvolume_store.clone(),
+            fs.dataset_store.clone(),
         );
 
-        // Create a snapshot of the root subvolume
+        // Create a snapshot of the root dataset
         let snapshot = snapshot_manager
             .create_snapshot(0, "test-snapshot".to_string(), 5000)
             .await

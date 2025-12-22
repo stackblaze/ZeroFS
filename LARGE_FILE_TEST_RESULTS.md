@@ -36,7 +36,7 @@ ef13c7850f03811f69754760b4c5627e0b49e9f8c51c490cd0ee9f5dcc8994b5  file-10mb.bin
 
 | Scenario | Time | Notes |
 |----------|------|-------|
-| Single snapshot (empty subvolume) | 0.133s | Root with 2 entries |
+| Single snapshot (empty dataset) | 0.133s | Root with 2 entries |
 | Single snapshot (62 existing snapshots) | 0.183s | Still sub-second |
 | 5 rapid snapshots | 1.520s | ~0.30s each |
 | Snapshot with NBD devices | 0.207s | 3 NBD devices in root |
@@ -80,11 +80,11 @@ Initial Space:   ~0 bytes (only metadata)
 
 ### Functionality Tests
 
-✅ **Subvolume creation**: Tested and working  
+✅ **Dataset creation**: Tested and working  
 ✅ **Snapshot creation**: Sub-second for all sizes  
 ✅ **Snapshot listing**: Fast retrieval of metadata  
 ✅ **Snapshot info**: Complete metadata display  
-✅ **Multiple sources**: Can snapshot different subvolumes  
+✅ **Multiple sources**: Can snapshot different datasets  
 ✅ **Read/write modes**: Both readonly and read-write snapshots supported  
 
 ### Data Integrity
@@ -100,7 +100,7 @@ The snapshot system correctly:
 
 | Metric | Value | Status |
 |--------|-------|--------|
-| Total subvolumes + snapshots | 38 | ✅ Working |
+| Total datasets + snapshots | 38 | ✅ Working |
 | Snapshot creation time | ~0.20s | ✅ Excellent |
 | Listing performance | 0.012s | ✅ Excellent |
 | NBD devices in snapshot | 3 devices (13TB total) | ✅ Working |
@@ -140,7 +140,7 @@ INFO: Successfully cloned and verified all 2 entries
 ### Scenario 1: Daily Backups
 ```bash
 # Create daily snapshot
-$ time zerofs subvolume snapshot root backup-$(date +%Y%m%d)
+$ time zerofs dataset snapshot root backup-$(date +%Y%m%d)
 real  0m0.183s   ← Instant!
 
 # 30 days = 30 snapshots
@@ -151,25 +151,25 @@ real  0m0.183s   ← Instant!
 ### Scenario 2: Development Testing
 ```bash
 # Snapshot before risky operation
-$ zerofs subvolume snapshot root before-update
+$ zerofs dataset snapshot root before-update
 
 # Make changes...
 # If something breaks, restore from snapshot
-$ zerofs subvolume restore \
+$ zerofs dataset restore \
     --snapshot before-update \
     --source config/app.yaml \
     --destination config/app.yaml
 ```
 
-### Scenario 3: Multiple Subvolumes
+### Scenario 3: Multiple Datasets
 ```bash
-# Different projects in different subvolumes
-$ zerofs subvolume create project-a
-$ zerofs subvolume create project-b
+# Different projects in different datasets
+$ zerofs dataset create project-a
+$ zerofs dataset create project-b
 
 # Independent snapshots
-$ zerofs subvolume snapshot project-a milestone-1
-$ zerofs subvolume snapshot project-b release-v2
+$ zerofs dataset snapshot project-a milestone-1
+$ zerofs dataset snapshot project-b release-v2
 ```
 
 ## Limitations Discovered
@@ -222,7 +222,7 @@ The ZeroFS snapshot system successfully handles large files and scales well:
 - Backup/restore operations
 - Point-in-time recovery
 - Development/testing workflows
-- Multi-tenant subvolume management
+- Multi-tenant dataset management
 
 **Benchmark Summary:**
 ```

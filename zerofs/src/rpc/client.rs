@@ -1,6 +1,6 @@
 use crate::checkpoint_manager::CheckpointInfo;
 use crate::config::RpcConfig;
-use crate::fs::subvolume::Subvolume;
+use crate::fs::dataset::Dataset;
 use crate::rpc::proto::{self, admin_service_client::AdminServiceClient};
 use anyhow::{Context, Result, anyhow};
 use hyper_util::rt::TokioIo;
@@ -166,71 +166,71 @@ impl RpcClient {
         Ok(response.into_inner())
     }
 
-    // Subvolume operations
-    pub async fn create_subvolume(&self, name: &str) -> Result<Subvolume> {
-        let request = proto::CreateSubvolumeRequest {
+    // Dataset operations
+    pub async fn create_dataset(&self, name: &str) -> Result<Dataset> {
+        let request = proto::CreateDatasetRequest {
             name: name.to_string(),
         };
 
         let response = self
             .client
             .clone()
-            .create_subvolume(request)
+            .create_dataset(request)
             .await
             .map_err(|s| anyhow!("{}", s.message()))?
             .into_inner();
 
         response
-            .subvolume
+            .dataset
             .ok_or_else(|| anyhow!("Empty response from server"))?
             .try_into()
             .map_err(|e| anyhow!("Invalid UUID: {}", e))
     }
 
-    pub async fn list_subvolumes(&self) -> Result<Vec<Subvolume>> {
-        let request = proto::ListSubvolumesRequest {};
+    pub async fn list_datasets(&self) -> Result<Vec<Dataset>> {
+        let request = proto::ListDatasetsRequest {};
 
         let response = self
             .client
             .clone()
-            .list_subvolumes(request)
+            .list_datasets(request)
             .await
             .map_err(|s| anyhow!("{}", s.message()))?
             .into_inner();
 
         response
-            .subvolumes
+            .datasets
             .into_iter()
             .map(|s| s.try_into().map_err(|e| anyhow!("Invalid UUID: {}", e)))
             .collect()
     }
 
-    pub async fn delete_subvolume(&self, name: &str) -> Result<()> {
-        let request = proto::DeleteSubvolumeRequest {
+    pub async fn delete_dataset(&self, name: &str) -> Result<()> {
+        let request = proto::DeleteDatasetRequest {
             name: name.to_string(),
         };
 
         self.client
             .clone()
-            .delete_subvolume(request)
+            .delete_dataset(request)
             .await
             .map_err(|s| anyhow!("{}", s.message()))?;
 
         Ok(())
     }
 
-    pub async fn get_subvolume_info(&self, name: &str) -> Result<Option<Subvolume>> {
-        let request = proto::GetSubvolumeInfoRequest {
+    pub async fn get_dataset_info(&self, name: &str) -> Result<Option<Dataset>> {
+        let request = proto::GetDatasetInfoRequest {
             name: name.to_string(),
         };
 
-        let result = self.client.clone().get_subvolume_info(request).await;
+        let result = self.client.clone().get_dataset_info(request).await;
 
         match result {
             Ok(response) => {
                 let info = response
                     .into_inner()
-                    .subvolume
+                    .dataset
                     .ok_or_else(|| anyhow!("Empty response from server"))?;
                 Ok(Some(
                     info.try_into()
@@ -242,36 +242,36 @@ impl RpcClient {
         }
     }
 
-    pub async fn set_default_subvolume(&self, name: &str) -> Result<()> {
-        let request = proto::SetDefaultSubvolumeRequest {
+    pub async fn set_default_dataset(&self, name: &str) -> Result<()> {
+        let request = proto::SetDefaultDatasetRequest {
             name: name.to_string(),
         };
 
         self.client
             .clone()
-            .set_default_subvolume(request)
+            .set_default_dataset(request)
             .await
             .map_err(|s| anyhow!("{}", s.message()))?;
 
         Ok(())
     }
 
-    pub async fn get_default_subvolume(&self) -> Result<u64> {
-        let request = proto::GetDefaultSubvolumeRequest {};
+    pub async fn get_default_dataset(&self) -> Result<u64> {
+        let request = proto::GetDefaultDatasetRequest {};
 
         let response = self
             .client
             .clone()
-            .get_default_subvolume(request)
+            .get_default_dataset(request)
             .await
             .map_err(|s| anyhow!("{}", s.message()))?
             .into_inner();
 
-        Ok(response.subvolume_id)
+        Ok(response.dataset_id)
     }
 
     // Snapshot operations
-    pub async fn create_snapshot_with_options(&self, source_name: &str, snapshot_name: &str, readonly: bool) -> Result<Subvolume> {
+    pub async fn create_snapshot_with_options(&self, source_name: &str, snapshot_name: &str, readonly: bool) -> Result<Dataset> {
         let request = proto::CreateSnapshotRequest {
             source_name: source_name.to_string(),
             snapshot_name: snapshot_name.to_string(),
@@ -293,7 +293,7 @@ impl RpcClient {
             .map_err(|e| anyhow!("Invalid UUID: {}", e))
     }
 
-    pub async fn list_snapshots(&self) -> Result<Vec<Subvolume>> {
+    pub async fn list_snapshots(&self) -> Result<Vec<Dataset>> {
         let request = proto::ListSnapshotsRequest {};
 
         let response = self
@@ -380,7 +380,7 @@ impl RpcClient {
     }
 
     // Convenience method for creating read-write snapshots (default, like btrfs)
-    pub async fn create_snapshot(&self, source_name: &str, snapshot_name: &str) -> Result<Subvolume> {
+    pub async fn create_snapshot(&self, source_name: &str, snapshot_name: &str) -> Result<Dataset> {
         self.create_snapshot_with_options(source_name, snapshot_name, false).await
     }
 }

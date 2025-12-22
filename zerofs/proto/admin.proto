@@ -15,18 +15,18 @@ service AdminService {
 
     rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
 
-    // Subvolume operations
-    rpc CreateSubvolume(CreateSubvolumeRequest) returns (CreateSubvolumeResponse);
+    // Dataset operations
+    rpc CreateDataset(CreateDatasetRequest) returns (CreateDatasetResponse);
 
-    rpc ListSubvolumes(ListSubvolumesRequest) returns (ListSubvolumesResponse);
+    rpc ListDatasets(ListDatasetsRequest) returns (ListDatasetsResponse);
 
-    rpc DeleteSubvolume(DeleteSubvolumeRequest) returns (DeleteSubvolumeResponse);
+    rpc DeleteDataset(DeleteDatasetRequest) returns (DeleteDatasetResponse);
 
-    rpc GetSubvolumeInfo(GetSubvolumeInfoRequest) returns (GetSubvolumeInfoResponse);
+    rpc GetDatasetInfo(GetDatasetInfoRequest) returns (GetDatasetInfoResponse);
 
-    rpc SetDefaultSubvolume(SetDefaultSubvolumeRequest) returns (SetDefaultSubvolumeResponse);
+    rpc SetDefaultDataset(SetDefaultDatasetRequest) returns (SetDefaultDatasetResponse);
 
-    rpc GetDefaultSubvolume(GetDefaultSubvolumeRequest) returns (GetDefaultSubvolumeResponse);
+    rpc GetDefaultDataset(GetDefaultDatasetRequest) returns (GetDefaultDatasetResponse);
 
     // Snapshot operations
     rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
@@ -111,8 +111,8 @@ message OperationParams {
     optional string filename = 6;
 }
 
-// Subvolume messages
-message SubvolumeInfo {
+// Dataset messages
+message DatasetInfo {
     uint64 id = 1;
     string name = 2;
     string uuid = 3;
@@ -126,44 +126,44 @@ message SubvolumeInfo {
     uint64 flags = 11;
 }
 
-message CreateSubvolumeRequest {
+message CreateDatasetRequest {
     string name = 1;
 }
 
-message CreateSubvolumeResponse {
-    SubvolumeInfo subvolume = 1;
+message CreateDatasetResponse {
+    DatasetInfo dataset = 1;
 }
 
-message ListSubvolumesRequest {}
+message ListDatasetsRequest {}
 
-message ListSubvolumesResponse {
-    repeated SubvolumeInfo subvolumes = 1;
+message ListDatasetsResponse {
+    repeated DatasetInfo datasets = 1;
 }
 
-message DeleteSubvolumeRequest {
+message DeleteDatasetRequest {
     string name = 1;
 }
 
-message DeleteSubvolumeResponse {}
+message DeleteDatasetResponse {}
 
-message GetSubvolumeInfoRequest {
+message GetDatasetInfoRequest {
     string name = 1;
 }
 
-message GetSubvolumeInfoResponse {
-    SubvolumeInfo subvolume = 1;
+message GetDatasetInfoResponse {
+    DatasetInfo dataset = 1;
 }
 
-message SetDefaultSubvolumeRequest {
+message SetDefaultDatasetRequest {
     string name = 1;
 }
 
-message SetDefaultSubvolumeResponse {}
+message SetDefaultDatasetResponse {}
 
-message GetDefaultSubvolumeRequest {}
+message GetDefaultDatasetRequest {}
 
-message GetDefaultSubvolumeResponse {
-    uint64 subvolume_id = 1;
+message GetDefaultDatasetResponse {
+    uint64 dataset_id = 1;
 }
 
 // Snapshot messages
@@ -174,13 +174,13 @@ message CreateSnapshotRequest {
 }
 
 message CreateSnapshotResponse {
-    SubvolumeInfo snapshot = 1;
+    DatasetInfo snapshot = 1;
 }
 
 message ListSnapshotsRequest {}
 
 message ListSnapshotsResponse {
-    repeated SubvolumeInfo snapshots = 1;
+    repeated DatasetInfo snapshots = 1;
 }
 
 message DeleteSnapshotRequest {

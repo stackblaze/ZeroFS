@@ -1,46 +1,46 @@
-# Btrfs-like Snapshots and Subvolumes for ZeroFS
+# Btrfs-like Snapshots and Datasets for ZeroFS
 
 ## Overview
 
-ZeroFS now supports btrfs-like snapshots and subvolumes with Copy-on-Write (COW) semantics, leveraging the SlateDB backend and checkpoint functionality.
+ZeroFS now supports btrfs-like snapshots and datasets with Copy-on-Write (COW) semantics, leveraging the SlateDB backend and checkpoint functionality.
 
 ## Features Implemented
 
-### 1. **Subvolume Support**
+### 1. **Dataset Support**
 - Multiple independent filesystem trees within a single ZeroFS instance
-- Each subvolume has its own root directory and UUID
-- Default subvolume selection for mounts
-- Read-only and read-write subvolumes
+- Each dataset has its own root directory and UUID
+- Default dataset selection for mounts
+- Read-only and read-write datasets
 
 ### 2. **Snapshot Support**
 - Point-in-time Copy-on-Write (COW) snapshots
-- Snapshots share data with source subvolume until modified
+- Snapshots share data with source dataset until modified
 - Read-only snapshots by default
 - Metadata includes parent relationship and UUIDs
 
 ### 3. **Data Structures**
 
-#### Subvolume Metadata
+#### Dataset Metadata
 ```rust
-pub struct Subvolume {
-    pub id: SubvolumeId,              // Unique subvolume ID
+pub struct Dataset {
+    pub id: DatasetId,              // Unique dataset ID
     pub name: String,                  // Human-readable name
     pub uuid: Uuid,                    // Unique UUID
-    pub parent_id: Option<SubvolumeId>, // Parent subvolume (for snapshots)
+    pub parent_id: Option<DatasetId>, // Parent dataset (for snapshots)
     pub parent_uuid: Option<Uuid>,     // Parent UUID (for tracking)
-    pub root_inode: u64,               // Root inode for this subvolume
+    pub root_inode: u64,               // Root inode for this dataset
     pub created_at: u64,               // Creation timestamp
     pub is_readonly: bool,             // Read-only flag
-    pub is_snapshot: bool,             // Snapshot vs subvolume
+    pub is_snapshot: bool,             // Snapshot vs dataset
     pub generation: u64,               // Generation number
     pub flags: u64,                    // Extension flags
 }
 ```
 
-#### Subvolume Registry
+#### Dataset Registry
 - Centralized registry stored in SlateDB
-- Maps subvolume names to IDs
-- Tracks default subvolume
+- Maps dataset names to IDs
+- Tracks default dataset
 - Persisted atomically with filesystem operations
 
 ### 4. **Copy-on-Write (COW) Mechanism**
@@ -58,39 +58,39 @@ This provides:
 
 ## CLI Commands
 
-### Subvolume Management
+### Dataset Management
 
 ```bash
-# Create a new subvolume
-zerofs subvolume create -c config.toml --name my-subvol
+# Create a new dataset
+zerofs dataset create -c config.toml --name my-subvol
 
-# List all subvolumes
-zerofs subvolume list -c config.toml
+# List all datasets
+zerofs dataset list -c config.toml
 
-# Get subvolume information
-zerofs subvolume info -c config.toml --name my-subvol
+# Get dataset information
+zerofs dataset info -c config.toml --name my-subvol
 
-# Delete a subvolume
-zerofs subvolume delete -c config.toml --name my-subvol
+# Delete a dataset
+zerofs dataset delete -c config.toml --name my-subvol
 
-# Set default subvolume (mounted by default)
-zerofs subvolume set-default -c config.toml --name my-subvol
+# Set default dataset (mounted by default)
+zerofs dataset set-default -c config.toml --name my-subvol
 
-# Get default subvolume
-zerofs subvolume get-default -c config.toml
+# Get default dataset
+zerofs dataset get-default -c config.toml
 ```
 
 ### Snapshot Management
 
 ```bash
 # Create a snapshot
-zerofs subvolume snapshot -c config.toml --source my-subvol --name my-snapshot
+zerofs dataset snapshot -c config.toml --source my-subvol --name my-snapshot
 
 # List all snapshots
-zerofs subvolume list-snapshots -c config.toml
+zerofs dataset list-snapshots -c config.toml
 
 # Delete a snapshot
-zerofs subvolume delete-snapshot -c config.toml --name my-snapshot
+zerofs dataset delete-snapshot -c config.toml --name my-snapshot
 ```
 
 ## RPC API
@@ -99,13 +99,13 @@ All operations are available via gRPC:
 
 ```protobuf
 service AdminService {
-    // Subvolume operations
-    rpc CreateSubvolume(CreateSubvolumeRequest) returns (CreateSubvolumeResponse);
-    rpc ListSubvolumes(ListSubvolumesRequest) returns (ListSubvolumesResponse);
-    rpc DeleteSubvolume(DeleteSubvolumeRequest) returns (DeleteSubvolumeResponse);
-    rpc GetSubvolumeInfo(GetSubvolumeInfoRequest) returns (GetSubvolumeInfoResponse);
-    rpc SetDefaultSubvolume(SetDefaultSubvolumeRequest) returns (SetDefaultSubvolumeResponse);
-    rpc GetDefaultSubvolume(GetDefaultSubvolumeRequest) returns (GetDefaultSubvolumeResponse);
+    // Dataset operations
+    rpc CreateDataset(CreateDatasetRequest) returns (CreateDatasetResponse);
+    rpc ListDatasets(ListDatasetsRequest) returns (ListDatasetsResponse);
+    rpc DeleteDataset(DeleteDatasetRequest) returns (DeleteDatasetResponse);
+    rpc GetDatasetInfo(GetDatasetInfoRequest) returns (GetDatasetInfoResponse);
+    rpc SetDefaultDataset(SetDefaultDatasetRequest) returns (SetDefaultDatasetResponse);
+    rpc GetDefaultDataset(GetDefaultDatasetRequest) returns (GetDefaultDatasetResponse);
 
     // Snapshot operations
     rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
@@ -118,8 +118,8 @@ service AdminService {
 
 ### Key Components
 
-1. **SubvolumeStore** (`src/fs/store/subvolume.rs`)
-   - Manages subvolume registry
+1. **DatasetStore** (`src/fs/store/dataset.rs`)
+   - Manages dataset registry
    - Persists metadata to SlateDB
    - Thread-safe with RwLock
 
@@ -129,7 +129,7 @@ service AdminService {
    - Manages reference counting
 
 3. **Key Codec Extensions** (`src/fs/key_codec.rs`)
-   - New key prefixes: `PREFIX_SUBVOLUME` (0x08), `PREFIX_SUBVOLUME_REGISTRY` (0x09)
+   - New key prefixes: `PREFIX_DATASET` (0x08), `PREFIX_DATASET_REGISTRY` (0x09)
    - Optimized for LSM tree performance
 
 4. **RPC Integration** (`src/rpc/server.rs`, `src/rpc/client.rs`)
@@ -148,47 +148,47 @@ SlateDB Keys:
 ├── 0x05 - STATS (filesystem statistics)
 ├── 0x06 - SYSTEM (system metadata)
 ├── 0x07 - TOMBSTONE (deleted file tracking for GC)
-├── 0x08 - SUBVOLUME (individual subvolume metadata)  ← NEW
-├── 0x09 - SUBVOLUME_REGISTRY (subvolume registry)    ← NEW
+├── 0x08 - DATASET (individual dataset metadata)  ← NEW
+├── 0x09 - DATASET_REGISTRY (dataset registry)    ← NEW
 └── 0xFE - CHUNK (file data chunks)
 ```
 
 ## Usage Examples
 
-### Example 1: Create and Snapshot a Subvolume
+### Example 1: Create and Snapshot a Dataset
 
 ```bash
 # Start ZeroFS server
 zerofs run -c zerofs.toml
 
-# Create a new subvolume for data
-zerofs subvolume create -c zerofs.toml --name data-vol
+# Create a new dataset for data
+zerofs dataset create -c zerofs.toml --name data-vol
 
 # ... populate data-vol with files ...
 
 # Create a snapshot before making changes
-zerofs subvolume snapshot -c zerofs.toml --source data-vol --name data-backup-$(date +%Y%m%d)
+zerofs dataset snapshot -c zerofs.toml --source data-vol --name data-backup-$(date +%Y%m%d)
 
 # Make changes to data-vol
 # The snapshot remains unchanged (COW)
 
 # List snapshots
-zerofs subvolume list-snapshots -c zerofs.toml
+zerofs dataset list-snapshots -c zerofs.toml
 ```
 
-### Example 2: Multiple Subvolumes
+### Example 2: Multiple Datasets
 
 ```bash
-# Create separate subvolumes for different purposes
-zerofs subvolume create -c zerofs.toml --name projects
-zerofs subvolume create -c zerofs.toml --name documents
-zerofs subvolume create -c zerofs.toml --name media
+# Create separate datasets for different purposes
+zerofs dataset create -c zerofs.toml --name projects
+zerofs dataset create -c zerofs.toml --name documents
+zerofs dataset create -c zerofs.toml --name media
 
-# List all subvolumes
-zerofs subvolume list -c zerofs.toml
+# List all datasets
+zerofs dataset list -c zerofs.toml
 
 # Set one as default
-zerofs subvolume set-default -c zerofs.toml --name projects
+zerofs dataset set-default -c zerofs.toml --name projects
 ```
 
 ## Integration with Existing Features
@@ -196,7 +196,7 @@ zerofs subvolume set-default -c zerofs.toml --name projects
 ### Checkpoints vs Snapshots
 
 - **Checkpoints**: SlateDB-level immutable database snapshots (full filesystem state)
-- **Snapshots**: Filesystem-level COW snapshots (subvolume-specific, space-efficient)
+- **Snapshots**: Filesystem-level COW snapshots (dataset-specific, space-efficient)
 
 Both features complement each other:
 - Checkpoints for disaster recovery
@@ -205,13 +205,13 @@ Both features complement each other:
 ### Compatibility
 
 - Fully compatible with existing ZeroFS operations
-- Root filesystem is automatically created as subvolume ID 0
-- Backward compatible with configurations without subvolumes
+- Root filesystem is automatically created as dataset ID 0
+- Backward compatible with configurations without datasets
 
 ## Performance Characteristics
 
 ### Snapshot Creation
-- **Time**: O(directory entries in subvolume root)
+- **Time**: O(directory entries in dataset root)
 - **Space**: O(metadata only), data is shared
 - **Typical**: < 1 second for directories with thousands of files
 
@@ -221,7 +221,7 @@ Both features complement each other:
 - Reference counting manages lifecycle
 
 ### Query Performance
-- Subvolume lookups: O(1) from registry
+- Dataset lookups: O(1) from registry
 - Snapshot enumeration: O(snapshots)
 
 ## Future Enhancements
@@ -230,11 +230,11 @@ Potential improvements for future versions:
 
 1. **Send/Receive**: Transfer snapshots between ZeroFS instances
 2. **Snapshot Diffs**: Calculate changes between snapshots
-3. **Nested Subvolumes**: Subvolumes within subvolumes
-4. **Quota Management**: Per-subvolume space limits
+3. **Nested Datasets**: Datasets within datasets
+4. **Quota Management**: Per-dataset space limits
 5. **Snapshot Scheduling**: Automatic periodic snapshots
 6. **Incremental Snapshots**: Track only changes since last snapshot
-7. **NBD Integration**: Mount specific subvolumes via NBD devices
+7. **NBD Integration**: Mount specific datasets via NBD devices
 
 ## Testing
 
@@ -242,7 +242,7 @@ Potential improvements for future versions:
 
 Run tests with:
 ```bash
-cargo test subvolume
+cargo test dataset
 cargo test snapshot_manager
 ```
 
@@ -252,14 +252,14 @@ cargo test snapshot_manager
 # Start server
 zerofs run -c test-config.toml
 
-# Create test subvolume
-zerofs subvolume create -c test-config.toml --name test
+# Create test dataset
+zerofs dataset create -c test-config.toml --name test
 
 # Create snapshot
-zerofs subvolume snapshot -c test-config.toml --source test --name test-snap
+zerofs dataset snapshot -c test-config.toml --source test --name test-snap
 
 # Verify
-zerofs subvolume list -c test-config.toml
+zerofs dataset list -c test-config.toml
 ```
 
 ## Technical Notes
@@ -270,7 +270,7 @@ zerofs subvolume list -c test-config.toml
 - Key prefixes designed for optimal SST organization
 
 ### Concurrency
-- SubvolumeStore uses `RwLock` for concurrent access
+- DatasetStore uses `RwLock` for concurrent access
 - Registry updates are atomic
 - Compatible with multi-threaded ZeroFS operations
 
@@ -295,8 +295,8 @@ cargo build --release
 
 ## Summary
 
-ZeroFS now provides a complete btrfs-like snapshot and subvolume system that:
-✅ Supports multiple independent filesystem trees (subvolumes)
+ZeroFS now provides a complete btrfs-like snapshot and dataset system that:
+✅ Supports multiple independent filesystem trees (datasets)
 ✅ Implements efficient Copy-on-Write snapshots
 ✅ Provides comprehensive CLI and RPC interfaces
 ✅ Integrates seamlessly with existing ZeroFS features

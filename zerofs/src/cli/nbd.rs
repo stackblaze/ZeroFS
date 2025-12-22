@@ -713,7 +713,7 @@ pub async fn create_snapshot(
 
     // Create snapshot
     let mut cmd = Command::new("btrfs");
-    cmd.arg("subvolume")
+    cmd.arg("dataset")
         .arg("snapshot");
 
     if read_only {
@@ -747,9 +747,9 @@ pub async fn list_snapshots(
         anyhow::bail!("Mount point {} does not exist", mount_point.display());
     }
 
-    // List all subvolumes (snapshots are subvolumes)
+    // List all datasets (snapshots are datasets)
     let output = Command::new("btrfs")
-        .arg("subvolume")
+        .arg("dataset")
         .arg("list")
         .arg("-o")
         .arg(mount_point.to_str().unwrap())
@@ -835,11 +835,11 @@ pub async fn restore_snapshot(
     println!("⚠ Warning: This will replace the target with snapshot contents!");
 
     // For BTRFS, we can either:
-    // 1. Delete target subvolume and create new snapshot from snapshot (if target is subvolume)
+    // 1. Delete target dataset and create new snapshot from snapshot (if target is dataset)
     // 2. Use send/receive (for cross-filesystem restore)
     // 3. Use rsync or similar (simple but not atomic)
 
-    // Check if target is the root of the filesystem (can't delete root subvolume)
+    // Check if target is the root of the filesystem (can't delete root dataset)
     let is_root = target == mount_point;
     
     if is_root {
@@ -860,34 +860,34 @@ pub async fn restore_snapshot(
             anyhow::bail!("Failed to restore snapshot contents");
         }
     } else {
-        // Check if target is a subvolume
+        // Check if target is a dataset
         let subvol_output = Command::new("btrfs")
-            .arg("subvolume")
+            .arg("dataset")
             .arg("show")
             .arg(target.to_str().unwrap())
             .output();
 
-        let is_subvolume = subvol_output.is_ok() && subvol_output.unwrap().status.success();
+        let is_dataset = subvol_output.is_ok() && subvol_output.unwrap().status.success();
 
-        if is_subvolume {
-            // Delete target subvolume and create new snapshot
-            println!("Target is a subvolume, deleting and recreating...");
+        if is_dataset {
+            // Delete target dataset and create new snapshot
+            println!("Target is a dataset, deleting and recreating...");
             
             // Delete target
             let delete_status = Command::new("btrfs")
-                .arg("subvolume")
+                .arg("dataset")
                 .arg("delete")
                 .arg(target.to_str().unwrap())
                 .status()
-                .context("Failed to delete target subvolume")?;
+                .context("Failed to delete target dataset")?;
 
             if !delete_status.success() {
-                anyhow::bail!("Failed to delete target subvolume");
+                anyhow::bail!("Failed to delete target dataset");
             }
 
             // Create new snapshot from snapshot
             let snapshot_status = Command::new("btrfs")
-                .arg("subvolume")
+                .arg("dataset")
                 .arg("snapshot")
                 .arg(snap_path.to_str().unwrap())
                 .arg(target.to_str().unwrap())
@@ -947,9 +947,9 @@ pub async fn delete_snapshot(
 
     println!("Deleting snapshot: {}...", snap_path.display());
 
-    // Delete snapshot (BTRFS subvolume)
+    // Delete snapshot (BTRFS dataset)
     let status = Command::new("btrfs")
-        .arg("subvolume")
+        .arg("dataset")
         .arg("delete")
         .arg(snap_path.to_str().unwrap())
         .status()

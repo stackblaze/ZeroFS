@@ -3,18 +3,18 @@
 ## ✅ Completed
 
 ### Core Functionality
-- **Subvolume Management**: Implemented `SubvolumeStore` for creating, listing, and managing subvolumes
+- **Dataset Management**: Implemented `DatasetStore` for creating, listing, and managing datasets
 - **Snapshot Creation**: Implemented COW (Copy-on-Write) snapshots via `SnapshotManager`
-- **Snapshot Metadata**: Subvolume and snapshot metadata stored in SlateDB with proper key codecs
+- **Snapshot Metadata**: Dataset and snapshot metadata stored in SlateDB with proper key codecs
 - **Read-Write Snapshots**: Snapshots are read-write by default (like btrfs), with optional read-only mode via `--readonly` flag
 
 ### CLI & RPC
-- **CLI Commands**: Full CLI support for subvolume and snapshot operations
-  - `zerofs subvolume create/list/delete/info`
-  - `zerofs subvolume snapshot [--readonly]`
-  - `zerofs subvolume list-snapshots/delete-snapshot`
-  - `zerofs subvolume set-default/get-default`
-- **RPC API**: Complete gRPC API for subvolume/snapshot management
+- **CLI Commands**: Full CLI support for dataset and snapshot operations
+  - `zerofs dataset create/list/delete/info`
+  - `zerofs dataset snapshot [--readonly]`
+  - `zerofs dataset list-snapshots/delete-snapshot`
+  - `zerofs dataset set-default/get-default`
+- **RPC API**: Complete gRPC API for dataset/snapshot management
 - **Client Library**: RPC client methods for all snapshot operations
 
 ### Virtual Filesystem Layer
@@ -26,9 +26,9 @@
 ### Testing via CLI
 ```bash
 # These commands work correctly:
-zerofs subvolume snapshot -c zerofs.toml root my-snapshot
-zerofs subvolume list-snapshots -c zerofs.toml
-zerofs subvolume snapshot -c zerofs.toml root readonly-snap --readonly
+zerofs dataset snapshot -c zerofs.toml root my-snapshot
+zerofs dataset list-snapshots -c zerofs.toml
+zerofs dataset snapshot -c zerofs.toml root readonly-snap --readonly
 ```
 
 ## 🔍 NFS Snapshot Access Research
@@ -36,7 +36,7 @@ zerofs subvolume snapshot -c zerofs.toml root readonly-snap --readonly
 **Finding**: Even **real btrfs has issues with snapshot visibility over NFS**!
 
 According to btrfs documentation, snapshots over NFS require:
-1. Each snapshot/subvolume needs a unique `fsid` when exported
+1. Each snapshot/dataset needs a unique `fsid` when exported
 2. Snapshots are accessed as **separate NFS exports**, not via `.snapshots` magic directory
 3. Alternative protocols like Samba work better for snapshot exposure
 
@@ -59,7 +59,7 @@ Instead of virtual `.snapshots`, create **real directories** when snapshots are 
 ls /mnt/zerofs-test/snapshots/backup-2024/
 ```
 
-This is **exactly how btrfs works over NFS** - snapshots are real subvolumes/directories, not magical hidden entries!
+This is **exactly how btrfs works over NFS** - snapshots are real datasets/directories, not magical hidden entries!
 
 ## 📊 Summary
 
@@ -71,13 +71,13 @@ The btrfs-like snapshot functionality is **fully implemented and working** at th
 
 ```bash
 # Create a snapshot (works)
-./zerofs/target/release/zerofs subvolume snapshot -c zerofs.toml root test-snap
+./zerofs/target/release/zerofs dataset snapshot -c zerofs.toml root test-snap
 
 # List snapshots (works)
-./zerofs/target/release/zerofs subvolume list-snapshots -c zerofs.toml
+./zerofs/target/release/zerofs dataset list-snapshots -c zerofs.toml
 
 # Access via CLI/RPC (works)
-./zerofs/target/release/zerofs subvolume info -c zerofs.toml test-snap
+./zerofs/target/release/zerofs dataset info -c zerofs.toml test-snap
 
 # For NFS access: Use separate exports or real directories
 # (This is standard btrfs-over-NFS practice)

@@ -13,22 +13,22 @@ The snapshot functionality uses **Copy-on-Write (COW)** semantics, which means:
 ### 1. Core Snapshot Functionality (100% Complete)
 ```bash
 # Create instant snapshot (COW, no data copying)
-zerofs subvolume snapshot -c zerofs.toml root backup-$(date +%s)
+zerofs dataset snapshot -c zerofs.toml root backup-$(date +%s)
 
 # List all snapshots
-zerofs subvolume list-snapshots -c zerofs.toml
+zerofs dataset list-snapshots -c zerofs.toml
 
 # Get snapshot details
-zerofs subvolume info -c zerofs.toml snapshot-name
+zerofs dataset info -c zerofs.toml snapshot-name
 
 # Delete snapshot
-zerofs subvolume delete-snapshot -c zerofs.toml snapshot-name
+zerofs dataset delete-snapshot -c zerofs.toml snapshot-name
 ```
 
 ### 2. Restore Command (CLI Ready)
 ```bash
 # Restore file from snapshot
-zerofs subvolume restore \
+zerofs dataset restore \
   -c zerofs.toml \
   --snapshot real-snapshot-1766248929 \
   --source /mnt/my-volume/test.txt \

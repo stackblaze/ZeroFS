@@ -2,10 +2,10 @@ pub mod chunk;
 pub mod directory;
 pub mod inode;
 pub mod tombstone;
-pub mod subvolume;
+pub mod dataset;
 
 pub use chunk::ChunkStore;
 pub use directory::DirectoryStore;
 pub use inode::InodeStore;
 pub use tombstone::TombstoneStore;
-pub use subvolume::SubvolumeStore;
+pub use dataset::DatasetStore;

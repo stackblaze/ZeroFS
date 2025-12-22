@@ -13,14 +13,14 @@ User question: "is that file size?"
 
 ## Explanation
 
-**No, it's not file size!** The column shows the **source subvolume ID** that the snapshot was created from.
+**No, it's not file size!** The column shows the **source dataset ID** that the snapshot was created from.
 
-- **Parent ID = 0** means the snapshot was created from the **root subvolume** (which has ID 0)
-- If you create a snapshot from a different subvolume, you'll see a different ID
+- **Parent ID = 0** means the snapshot was created from the **root dataset** (which has ID 0)
+- If you create a snapshot from a different dataset, you'll see a different ID
 
 ## Solution
 
-Changed the column to display the **source subvolume name** instead of just the ID, and renamed it to "Source" for clarity.
+Changed the column to display the **source dataset name** instead of just the ID, and renamed it to "Source" for clarity.
 
 ### Before
 ```
@@ -31,21 +31,21 @@ Changed the column to display the **source subvolume name** instead of just the 
 ### After
 ```
 │ Source    ┆
-│ root      ┆  ← Clear! Snapshot is from "root" subvolume
+│ root      ┆  ← Clear! Snapshot is from "root" dataset
 ```
 
 ## Implementation
 
-Modified `zerofs/src/cli/subvolume.rs` in the `list_snapshots` function:
+Modified `zerofs/src/cli/dataset.rs` in the `list_snapshots` function:
 
-1. Fetch all subvolumes to build an ID→name mapping
-2. Look up the source subvolume name for each snapshot
+1. Fetch all datasets to build an ID→name mapping
+2. Look up the source dataset name for each snapshot
 3. Display the name instead of the ID
 
 ```rust
-// Get all subvolumes to map IDs to names
-let subvolumes = client.list_subvolumes().await?;
-let mut id_to_name: HashMap<u64, String> = subvolumes
+// Get all datasets to map IDs to names
+let datasets = client.list_datasets().await?;
+let mut id_to_name: HashMap<u64, String> = datasets
     .into_iter()
     .map(|s| (s.id, s.name))
     .collect();
@@ -68,29 +68,29 @@ let source = snapshot.parent_id
 ```
 
 Now it's immediately clear:
-- Most snapshots are from the `root` subvolume
-- One snapshot (`snapshot-of-my-subvol`) is from a different subvolume (`my-subvol`)
+- Most snapshots are from the `root` dataset
+- One snapshot (`snapshot-of-my-subvol`) is from a different dataset (`my-subvol`)
 
 ## Example Usage
 
 ```bash
-# Create a subvolume
-zerofs subvolume create -c zerofs.toml my-data
+# Create a dataset
+zerofs dataset create -c zerofs.toml my-data
 
 # Create a snapshot of it
-zerofs subvolume snapshot -c zerofs.toml my-data backup-of-my-data
+zerofs dataset snapshot -c zerofs.toml my-data backup-of-my-data
 
 # List snapshots - now shows "my-data" in Source column
-zerofs subvolume list-snapshots -c zerofs.toml
+zerofs dataset list-snapshots -c zerofs.toml
 ```
 
 ## Files Changed
 
-- `zerofs/src/cli/subvolume.rs`:
+- `zerofs/src/cli/dataset.rs`:
   - Lines 160-192: `list_snapshots` function
   - Changed column header from "Parent ID" to "Source"
   - Added ID→name mapping lookup
-  - Display source subvolume name instead of raw ID
+  - Display source dataset name instead of raw ID
 
 ## Status: ✅ Complete
 

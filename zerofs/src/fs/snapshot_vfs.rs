@@ -2,8 +2,8 @@
 /// This makes snapshots accessible at /.snapshots/<snapshot-name>/
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, Inode, InodeId};
-use crate::fs::store::SubvolumeStore;
-use crate::fs::subvolume::Subvolume;
+use crate::fs::store::DatasetStore;
+use crate::fs::dataset::Dataset;
 
 /// Special inode ID for the .snapshots directory
 /// We use a very high ID that won't conflict with regular inodes
@@ -15,12 +15,12 @@ pub const SNAPSHOT_BASE_INODE: InodeId = u64::MAX - 1_000_000;
 
 #[derive(Clone)]
 pub struct SnapshotVfs {
-    subvolume_store: SubvolumeStore,
+    dataset_store: DatasetStore,
 }
 
 impl SnapshotVfs {
-    pub fn new(subvolume_store: SubvolumeStore) -> Self {
-        Self { subvolume_store }
+    pub fn new(dataset_store: DatasetStore) -> Self {
+        Self { dataset_store }
     }
 
     /// Check if this is the .snapshots directory inode
@@ -57,10 +57,10 @@ impl SnapshotVfs {
         let name_str = std::str::from_utf8(name).map_err(|_| FsError::InvalidArgument)?;
         
         // Find the snapshot by name
-        let snapshot = self.subvolume_store.get_by_name(name_str).await
+        let snapshot = self.dataset_store.get_by_name(name_str).await
             .ok_or(FsError::NotFound)?;
         
-        // Only allow access to actual snapshots, not regular subvolumes
+        // Only allow access to actual snapshots, not regular datasets
         if !snapshot.is_snapshot {
             return Err(FsError::NotFound);
         }
@@ -90,7 +90,7 @@ impl SnapshotVfs {
 
     /// Get the virtual inode for a snapshot directory
     pub async fn get_snapshot_dir_inode(&self, snapshot_id: u64) -> Result<Inode, FsError> {
-        let snapshot = self.subvolume_store.get_by_id(snapshot_id).await
+        let snapshot = self.dataset_store.get_by_id(snapshot_id).await
             .ok_or(FsError::NotFound)?;
 
         if !snapshot.is_snapshot {
@@ -119,7 +119,7 @@ impl SnapshotVfs {
 
     /// Get the actual root inode ID for a snapshot
     pub async fn get_snapshot_root_inode(&self, snapshot_id: u64) -> Result<InodeId, FsError> {
-        let snapshot = self.subvolume_store.get_by_id(snapshot_id).await
+        let snapshot = self.dataset_store.get_by_id(snapshot_id).await
             .ok_or(FsError::NotFound)?;
 
         if !snapshot.is_snapshot {
@@ -130,8 +130,8 @@ impl SnapshotVfs {
     }
 
     /// List all snapshots for readdir on .snapshots
-    pub async fn list_snapshots(&self) -> Vec<Subvolume> {
-        self.subvolume_store.list_snapshots().await
+    pub async fn list_snapshots(&self) -> Vec<Dataset> {
+        self.dataset_store.list_snapshots().await
     }
 
     /// Check if an inode should be treated as read-only (snapshot content)

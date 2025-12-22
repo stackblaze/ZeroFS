@@ -21,7 +21,7 @@ sudo zerofs nbd export -c zerofs.toml \
   --mount-point /mnt/storage
 
 # 3. Create a snapshot
-sudo btrfs subvolume snapshot /mnt/storage /mnt/storage/@snapshots/backup-$(date +%Y%m%d)
+sudo btrfs dataset snapshot /mnt/storage /mnt/storage/@snapshots/backup-$(date +%Y%m%d)
 
 # 4. Clients mount via NFS
 sudo mount -t nfs server-ip:/mnt/storage /mnt/remote
@@ -33,7 +33,7 @@ sudo mount -t nfs server-ip:/mnt/storage /mnt/remote
 - Instant snapshots (copy-on-write)
 - Space-efficient (only stores changes)
 - No performance impact during snapshot
-- Can snapshot individual subvolumes
+- Can snapshot individual datasets
 
 ### ✅ Compression
 - Automatic zstd compression
@@ -47,8 +47,8 @@ sudo mount -t nfs server-ip:/mnt/storage /mnt/remote
 - Self-healing with RAID profiles
 
 ### ✅ Flexibility
-- Subvolumes for organization
-- Quotas per subvolume
+- Datasets for organization
+- Quotas per dataset
 - Online defragmentation
 - Easy to manage
 
@@ -68,7 +68,7 @@ sudo mount -t nfs server-ip:/mnt/storage /mnt/remote
       │ NFS Export  │
       │     ↓       │
       │   Btrfs     │ ← Snapshots, compression
-      │ Subvolumes  │
+      │ Datasets  │
       │     ↓       │
       │ /dev/nbd0   │ ← NBD block device
       └─────────────┘
@@ -100,8 +100,8 @@ sudo zerofs nbd export -c zerofs.toml \
 ```
 
 **What gets created:**
-- `/mnt/mydata/@` - Main subvolume
-- `/mnt/mydata/@home` - Home directories subvolume
+- `/mnt/mydata/@` - Main dataset
+- `/mnt/mydata/@home` - Home directories dataset
 - `/mnt/mydata/@snapshots` - Snapshots directory
 - Compression: zstd (automatic)
 - NFS export: `/mnt/mydata`
@@ -109,7 +109,7 @@ sudo zerofs nbd export -c zerofs.toml \
 ### Step 2: Use the Filesystem
 
 ```bash
-# Write data to main subvolume
+# Write data to main dataset
 echo "test data" > /mnt/mydata/@/file.txt
 
 # Or use @home for user data
@@ -120,16 +120,16 @@ echo "user data" > /mnt/mydata/@home/user1/document.txt
 ### Step 3: Create Snapshots
 
 ```bash
-# Snapshot the main subvolume
-sudo btrfs subvolume snapshot /mnt/mydata/@ \
+# Snapshot the main dataset
+sudo btrfs dataset snapshot /mnt/mydata/@ \
   /mnt/mydata/@snapshots/root-$(date +%Y%m%d-%H%M)
 
 # Snapshot home directories
-sudo btrfs subvolume snapshot /mnt/mydata/@home \
+sudo btrfs dataset snapshot /mnt/mydata/@home \
   /mnt/mydata/@snapshots/home-$(date +%Y%m%d-%H%M)
 
 # Read-only snapshot (recommended for backups)
-sudo btrfs subvolume snapshot -r /mnt/mydata/@ \
+sudo btrfs dataset snapshot -r /mnt/mydata/@ \
   /mnt/mydata/@snapshots/root-$(date +%Y%m%d-%H%M)-ro
 ```
 
@@ -138,11 +138,11 @@ sudo btrfs subvolume snapshot -r /mnt/mydata/@ \
 ### List Snapshots
 
 ```bash
-# List all subvolumes (including snapshots)
-sudo btrfs subvolume list /mnt/mydata
+# List all datasets (including snapshots)
+sudo btrfs dataset list /mnt/mydata
 
 # Show snapshot details
-sudo btrfs subvolume show /mnt/mydata/@snapshots/root-20251202-1430
+sudo btrfs dataset show /mnt/mydata/@snapshots/root-20251202-1430
 ```
 
 ### Browse Snapshot Data
@@ -163,7 +163,7 @@ cp /mnt/mydata/@snapshots/root-20251202-1430/file.txt \
 cp /mnt/mydata/@snapshots/root-20251202-1430/important.txt \
    /mnt/mydata/@/
 
-# Method 2: Rollback entire subvolume
+# Method 2: Rollback entire dataset
 # (Requires unmounting and remounting)
 sudo umount /mnt/mydata
 sudo mount /dev/nbd0 -o subvol=@snapshots/root-20251202-1430 /mnt/mydata
@@ -173,10 +173,10 @@ sudo mount /dev/nbd0 -o subvol=@snapshots/root-20251202-1430 /mnt/mydata
 
 ```bash
 # Delete old snapshot
-sudo btrfs subvolume delete /mnt/mydata/@snapshots/root-20251201-1000
+sudo btrfs dataset delete /mnt/mydata/@snapshots/root-20251201-1000
 
 # Delete multiple snapshots
-sudo btrfs subvolume delete /mnt/mydata/@snapshots/root-*
+sudo btrfs dataset delete /mnt/mydata/@snapshots/root-*
 ```
 
 ## Automated Snapshots
@@ -191,11 +191,11 @@ MOUNT="/mnt/mydata"
 TIMESTAMP=$(date +%Y%m%d-%H%M)
 
 # Create snapshots
-btrfs subvolume snapshot -r "$MOUNT/@" "$MOUNT/@snapshots/root-$TIMESTAMP"
-btrfs subvolume snapshot -r "$MOUNT/@home" "$MOUNT/@snapshots/home-$TIMESTAMP"
+btrfs dataset snapshot -r "$MOUNT/@" "$MOUNT/@snapshots/root-$TIMESTAMP"
+btrfs dataset snapshot -r "$MOUNT/@home" "$MOUNT/@snapshots/home-$TIMESTAMP"
 
 # Delete snapshots older than 7 days
-find "$MOUNT/@snapshots" -maxdepth 1 -type d -mtime +7 -exec btrfs subvolume delete {} \;
+find "$MOUNT/@snapshots" -maxdepth 1 -type d -mtime +7 -exec btrfs dataset delete {} \;
 
 echo "Snapshots created: root-$TIMESTAMP, home-$TIMESTAMP"
 EOF
@@ -239,7 +239,7 @@ sudo snapper -c mydata undochange 1..2
 ### Mount on Clients
 
 ```bash
-# Clients see the main subvolume via NFS
+# Clients see the main dataset via NFS
 sudo mount -t nfs server-ip:/mnt/mydata /mnt/remote
 
 # Access data
@@ -305,7 +305,7 @@ sudo btrfs filesystem defragment -r -czstd /mnt/mydata/@
 # Enable quota support
 sudo btrfs quota enable /mnt/mydata
 
-# Set quota for @home subvolume (50GB limit)
+# Set quota for @home dataset (50GB limit)
 sudo btrfs qgroup limit 50G /mnt/mydata/@home
 
 # Check quota usage
@@ -350,7 +350,7 @@ sudo mount -o remount,commit=120 /mnt/mydata
 
 ```bash
 # Create read-only snapshot
-sudo btrfs subvolume snapshot -r /mnt/mydata/@ \
+sudo btrfs dataset snapshot -r /mnt/mydata/@ \
   /mnt/mydata/@snapshots/backup-$(date +%Y%m%d)
 
 # Send to another server
@@ -427,7 +427,7 @@ sudo btrfs filesystem usage /mnt/mydata
 sudo btrfs balance start -dusage=50 /mnt/mydata
 
 # Delete old snapshots
-sudo btrfs subvolume delete /mnt/mydata/@snapshots/old-*
+sudo btrfs dataset delete /mnt/mydata/@snapshots/old-*
 ```
 
 ### Slow Performance
@@ -472,8 +472,8 @@ cat <<'EOF' | sudo tee /usr/local/bin/snapshot-production.sh
 #!/bin/bash
 MOUNT="/mnt/production"
 TIMESTAMP=$(date +%Y%m%d-%H%M)
-btrfs subvolume snapshot -r "$MOUNT/@" "$MOUNT/@snapshots/prod-$TIMESTAMP"
-find "$MOUNT/@snapshots" -maxdepth 1 -type d -mtime +30 -exec btrfs subvolume delete {} \;
+btrfs dataset snapshot -r "$MOUNT/@" "$MOUNT/@snapshots/prod-$TIMESTAMP"
+find "$MOUNT/@snapshots" -maxdepth 1 -type d -mtime +30 -exec btrfs dataset delete {} \;
 EOF
 
 sudo chmod +x /usr/local/bin/snapshot-production.sh
@@ -509,7 +509,7 @@ With btrfs as the default, you get:
 ✅ **S3 backend** - Durable, scalable storage  
 ✅ **NFS sharing** - Simple client access  
 ✅ **One command setup** - `zerofs nbd export`  
-✅ **Subvolumes** - Organize data logically  
+✅ **Datasets** - Organize data logically  
 ✅ **Data integrity** - Checksums on everything  
 
 Perfect for providing snapshot-capable storage backed by S3! 🚀

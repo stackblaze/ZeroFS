@@ -126,94 +126,94 @@ impl AdminService for AdminRpcServer {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    async fn create_subvolume(
+    async fn create_dataset(
         &self,
-        request: Request<proto::CreateSubvolumeRequest>,
-    ) -> Result<Response<proto::CreateSubvolumeResponse>, Status> {
+        request: Request<proto::CreateDatasetRequest>,
+    ) -> Result<Response<proto::CreateDatasetResponse>, Status> {
         let name = request.into_inner().name;
         
-        // Allocate a new inode for the subvolume root
+        // Allocate a new inode for the dataset root
         let root_inode = self.snapshot_manager.allocate_inode();
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let subvolume = self
+        let dataset = self
             .snapshot_manager
-            .create_subvolume(name, root_inode, created_at, false)
+            .create_dataset(name, root_inode, created_at, false)
             .await
-            .map_err(|e| Status::internal(format!("Failed to create subvolume: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to create dataset: {}", e)))?;
 
-        Ok(Response::new(proto::CreateSubvolumeResponse {
-            subvolume: Some(subvolume.into()),
+        Ok(Response::new(proto::CreateDatasetResponse {
+            dataset: Some(dataset.into()),
         }))
     }
 
-    async fn list_subvolumes(
+    async fn list_datasets(
         &self,
-        _request: Request<proto::ListSubvolumesRequest>,
-    ) -> Result<Response<proto::ListSubvolumesResponse>, Status> {
-        let subvolumes = self.snapshot_manager.list_subvolumes().await;
+        _request: Request<proto::ListDatasetsRequest>,
+    ) -> Result<Response<proto::ListDatasetsResponse>, Status> {
+        let datasets = self.snapshot_manager.list_datasets().await;
 
-        Ok(Response::new(proto::ListSubvolumesResponse {
-            subvolumes: subvolumes.into_iter().map(|s| s.into()).collect(),
+        Ok(Response::new(proto::ListDatasetsResponse {
+            datasets: datasets.into_iter().map(|s| s.into()).collect(),
         }))
     }
 
-    async fn delete_subvolume(
+    async fn delete_dataset(
         &self,
-        request: Request<proto::DeleteSubvolumeRequest>,
-    ) -> Result<Response<proto::DeleteSubvolumeResponse>, Status> {
+        request: Request<proto::DeleteDatasetRequest>,
+    ) -> Result<Response<proto::DeleteDatasetResponse>, Status> {
         let name = request.into_inner().name;
 
         self.snapshot_manager
-            .delete_subvolume(&name)
+            .delete_dataset(&name)
             .await
-            .map_err(|e| Status::internal(format!("Failed to delete subvolume: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to delete dataset: {}", e)))?;
 
-        Ok(Response::new(proto::DeleteSubvolumeResponse {}))
+        Ok(Response::new(proto::DeleteDatasetResponse {}))
     }
 
-    async fn get_subvolume_info(
+    async fn get_dataset_info(
         &self,
-        request: Request<proto::GetSubvolumeInfoRequest>,
-    ) -> Result<Response<proto::GetSubvolumeInfoResponse>, Status> {
+        request: Request<proto::GetDatasetInfoRequest>,
+    ) -> Result<Response<proto::GetDatasetInfoResponse>, Status> {
         let name = request.into_inner().name;
 
-        let subvolume = self
+        let dataset = self
             .snapshot_manager
-            .get_subvolume_by_name(&name)
+            .get_dataset_by_name(&name)
             .await
-            .ok_or_else(|| Status::not_found(format!("Subvolume '{}' not found", name)))?;
+            .ok_or_else(|| Status::not_found(format!("Dataset '{}' not found", name)))?;
 
-        Ok(Response::new(proto::GetSubvolumeInfoResponse {
-            subvolume: Some(subvolume.into()),
+        Ok(Response::new(proto::GetDatasetInfoResponse {
+            dataset: Some(dataset.into()),
         }))
     }
 
-    async fn set_default_subvolume(
+    async fn set_default_dataset(
         &self,
-        request: Request<proto::SetDefaultSubvolumeRequest>,
-    ) -> Result<Response<proto::SetDefaultSubvolumeResponse>, Status> {
+        request: Request<proto::SetDefaultDatasetRequest>,
+    ) -> Result<Response<proto::SetDefaultDatasetResponse>, Status> {
         let name = request.into_inner().name;
 
         self.snapshot_manager
-            .set_default_subvolume(&name)
+            .set_default_dataset(&name)
             .await
-            .map_err(|e| Status::internal(format!("Failed to set default subvolume: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to set default dataset: {}", e)))?;
 
-        Ok(Response::new(proto::SetDefaultSubvolumeResponse {}))
+        Ok(Response::new(proto::SetDefaultDatasetResponse {}))
     }
 
-    async fn get_default_subvolume(
+    async fn get_default_dataset(
         &self,
-        _request: Request<proto::GetDefaultSubvolumeRequest>,
-    ) -> Result<Response<proto::GetDefaultSubvolumeResponse>, Status> {
-        let subvolume_id = self.snapshot_manager.get_default_subvolume().await;
+        _request: Request<proto::GetDefaultDatasetRequest>,
+    ) -> Result<Response<proto::GetDefaultDatasetResponse>, Status> {
+        let dataset_id = self.snapshot_manager.get_default_dataset().await;
 
-        Ok(Response::new(proto::GetDefaultSubvolumeResponse {
-            subvolume_id,
+        Ok(Response::new(proto::GetDefaultDatasetResponse {
+            dataset_id,
         }))
     }
 
@@ -282,7 +282,7 @@ impl AdminService for AdminRpcServer {
 
         // Get snapshot info
         let snapshot = self.snapshot_manager
-            .get_subvolume_by_name(&snapshot_name)
+            .get_dataset_by_name(&snapshot_name)
             .await
             .ok_or_else(|| Status::not_found(format!("Snapshot '{}' not found", snapshot_name)))?;
 
@@ -391,7 +391,7 @@ impl AdminService for AdminRpcServer {
 
         // Get snapshot info
         let snapshot = self.snapshot_manager
-            .get_subvolume_by_name(&snapshot_name)
+            .get_dataset_by_name(&snapshot_name)
             .await
             .ok_or_else(|| Status::not_found(format!("Snapshot '{}' not found", snapshot_name)))?;
 
@@ -456,9 +456,9 @@ impl AdminService for AdminRpcServer {
         let filename = dest_parts.last().unwrap();
         let dir_parts = &dest_parts[..dest_parts.len() - 1];
 
-        // Navigate to destination directory (start from root subvolume)
-        let root_subvol = self.snapshot_manager.get_subvolume_by_name("root").await
-            .ok_or_else(|| Status::internal("Root subvolume not found"))?;
+        // Navigate to destination directory (start from root dataset)
+        let root_subvol = self.snapshot_manager.get_dataset_by_name("root").await
+            .ok_or_else(|| Status::internal("Root dataset not found"))?;
         
         let mut dest_dir_inode = root_subvol.root_inode;
         

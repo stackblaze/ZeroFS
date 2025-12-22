@@ -10,15 +10,15 @@ ZeroFS implements **Copy-on-Write (COW) snapshots** similar to btrfs, where snap
 
 When you create a snapshot with:
 ```bash
-zerofs subvolume snapshot -c zerofs.toml root my-snapshot
+zerofs dataset snapshot -c zerofs.toml root my-snapshot
 ```
 
 Here's what happens internally:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ 1. Get Source Subvolume                                     │
-│    - Load "root" subvolume metadata                         │
+│ 1. Get Source Dataset                                     │
+│    - Load "root" dataset metadata                         │
 │    - Find its root inode (typically inode 0)                │
 └─────────────────────────────────────────────────────────────┘
                            ↓
@@ -38,11 +38,11 @@ Here's what happens internally:
 └─────────────────────────────────────────────────────────────┘
                            ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ 4. Create Subvolume Metadata                               │
+│ 4. Create Dataset Metadata                               │
 │    - Store snapshot info in SlateDB:                        │
 │      • Name: "my-snapshot"                                  │
 │      • UUID: <new UUID>                                     │
-│      • Parent ID: 0 (source subvolume)                      │
+│      • Parent ID: 0 (source dataset)                      │
 │      • Root inode: 9 (new snapshot root)                    │
 │      • is_snapshot: true                                    │
 └─────────────────────────────────────────────────────────────┘
@@ -115,8 +115,8 @@ async fn clone_directory_entries(
 #### **Data Structure in SlateDB**
 ```
 Key Prefix Structure:
-0x08 + UUID → Subvolume metadata (name, parent_id, root_inode)
-0x09 + UUID → Snapshot metadata (same as subvolume)
+0x08 + UUID → Dataset metadata (name, parent_id, root_inode)
+0x09 + UUID → Snapshot metadata (same as dataset)
 0x01 + inode_id → Inode data (file metadata, nlink count)
 0x02 + dir_id + name → Directory entry (maps name to inode_id)
 0x03 + dir_id + cookie → Directory scan entry (for readdir)
@@ -128,7 +128,7 @@ Key Prefix Structure:
 
 When you restore a file:
 ```bash
-zerofs subvolume restore \
+zerofs dataset restore \
   --snapshot my-snapshot \
   --source path/to/file.txt \
   --destination /tmp/restored.txt
@@ -224,7 +224,7 @@ Restore:  Stream chunks directly from SlateDB
 ┌─────────────────────────────────────────────────────────┐
 │                    ZeroFS Layer                         │
 │  ┌──────────────┐           ┌──────────────┐           │
-│  │ Subvolume    │           │  Snapshot    │           │
+│  │ Dataset    │           │  Snapshot    │           │
 │  │ "root" (0)   │           │ "my-snap" (9)│           │
 │  │ root_inode:0 │           │ root_inode:9 │           │
 │  └──────┬───────┘           └──────┬───────┘           │
@@ -270,22 +270,22 @@ Restore:  Stream chunks directly from SlateDB
 
 ### Create Snapshot
 ```bash
-# Snapshot the root subvolume
-zerofs subvolume snapshot -c zerofs.toml root backup-$(date +%s)
+# Snapshot the root dataset
+zerofs dataset snapshot -c zerofs.toml root backup-$(date +%s)
 
 # Snapshot with read-only flag
-zerofs subvolume snapshot -c zerofs.toml --readonly root ro-backup
+zerofs dataset snapshot -c zerofs.toml --readonly root ro-backup
 ```
 
 ### List Snapshots
 ```bash
-zerofs subvolume list-snapshots -c zerofs.toml
+zerofs dataset list-snapshots -c zerofs.toml
 ```
 
 ### Restore File
 ```bash
 # Restore specific file from snapshot
-zerofs subvolume restore \
+zerofs dataset restore \
   -c zerofs.toml \
   --snapshot backup-1234567890 \
   --source path/to/file.txt \
@@ -294,15 +294,15 @@ zerofs subvolume restore \
 
 ### Get Snapshot Info
 ```bash
-zerofs subvolume info -c zerofs.toml backup-1234567890
+zerofs dataset info -c zerofs.toml backup-1234567890
 ```
 
 ## Implementation Files
 
 - **`zerofs/src/fs/snapshot_manager.rs`**: Core snapshot creation/deletion logic
-- **`zerofs/src/fs/subvolume.rs`**: Subvolume and snapshot data structures
-- **`zerofs/src/fs/store/subvolume.rs`**: Persistence layer for subvolumes
-- **`zerofs/src/cli/subvolume.rs`**: CLI commands for snapshot management
+- **`zerofs/src/fs/dataset.rs`**: Dataset and snapshot data structures
+- **`zerofs/src/fs/store/dataset.rs`**: Persistence layer for datasets
+- **`zerofs/src/cli/dataset.rs`**: CLI commands for snapshot management
 - **`zerofs/src/rpc/server.rs`**: RPC endpoints for snapshot operations
 - **`zerofs/src/rpc/proto/admin.proto`**: Protocol buffer definitions
 

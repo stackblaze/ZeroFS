@@ -24,7 +24,7 @@
 When you create a snapshot:
 
 ```bash
-zerofs subvolume snapshot -c zerofs.toml root my-snapshot
+zerofs dataset snapshot -c zerofs.toml root my-snapshot
 ```
 
 The system:
@@ -67,7 +67,7 @@ cd /mnt/zerofs-test/mnt/my-volume
 echo "Test data" > test.txt
 
 # Create snapshot (creates real /snapshots/ directory)
-zerofs subvolume snapshot -c zerofs.toml root backup-$(date +%s)
+zerofs dataset snapshot -c zerofs.toml root backup-$(date +%s)
 
 # Access snapshot directly (works immediately)
 cd /snapshots/backup-*/

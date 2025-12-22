@@ -135,36 +135,36 @@ async fn main() -> Result<()> {
                 cli::nbd::delete_snapshot(config, name, mount_point, snapshot_name, snapshot_path).await?;
             }
         },
-        cli::Commands::Subvolume { subcommand } => match subcommand {
-            cli::SubvolumeCommands::Create { config, name } => {
-                cli::subvolume::create_subvolume(&config, &name).await?;
+        cli::Commands::Dataset { subcommand } => match subcommand {
+            cli::DatasetCommands::Create { config, name } => {
+                cli::dataset::create_dataset(&config, &name).await?;
             }
-            cli::SubvolumeCommands::List { config } => {
-                cli::subvolume::list_subvolumes(&config).await?;
+            cli::DatasetCommands::List { config } => {
+                cli::dataset::list_datasets(&config).await?;
             }
-            cli::SubvolumeCommands::Delete { config, name } => {
-                cli::subvolume::delete_subvolume(&config, &name).await?;
+            cli::DatasetCommands::Delete { config, name } => {
+                cli::dataset::delete_dataset(&config, &name).await?;
             }
-            cli::SubvolumeCommands::Info { config, name } => {
-                cli::subvolume::get_subvolume_info(&config, &name).await?;
+            cli::DatasetCommands::Info { config, name } => {
+                cli::dataset::get_dataset_info(&config, &name).await?;
             }
-            cli::SubvolumeCommands::Snapshot { config, source, name, readonly } => {
-                cli::subvolume::create_snapshot(&config, &source, &name, readonly).await?;
+            cli::DatasetCommands::Snapshot { config, source, name, readonly } => {
+                cli::dataset::create_snapshot(&config, &source, &name, readonly).await?;
             }
-            cli::SubvolumeCommands::ListSnapshots { config } => {
-                cli::subvolume::list_snapshots(&config).await?;
+            cli::DatasetCommands::ListSnapshots { config } => {
+                cli::dataset::list_snapshots(&config).await?;
             }
-            cli::SubvolumeCommands::DeleteSnapshot { config, name } => {
-                cli::subvolume::delete_snapshot(&config, &name).await?;
+            cli::DatasetCommands::DeleteSnapshot { config, name } => {
+                cli::dataset::delete_snapshot(&config, &name).await?;
             }
-            cli::SubvolumeCommands::SetDefault { config, name } => {
-                cli::subvolume::set_default_subvolume(&config, &name).await?;
+            cli::DatasetCommands::SetDefault { config, name } => {
+                cli::dataset::set_default_dataset(&config, &name).await?;
             }
-            cli::SubvolumeCommands::GetDefault { config } => {
-                cli::subvolume::get_default_subvolume(&config).await?;
+            cli::DatasetCommands::GetDefault { config } => {
+                cli::dataset::get_default_dataset(&config).await?;
             }
-            cli::SubvolumeCommands::Restore { config, snapshot, source, destination } => {
-                cli::subvolume::restore_from_snapshot(&config, &snapshot, &source, &destination).await?;
+            cli::DatasetCommands::Restore { config, snapshot, source, destination } => {
+                cli::dataset::restore_from_snapshot(&config, &snapshot, &source, &destination).await?;
             }
         },
         cli::Commands::Fatrace { config } => {

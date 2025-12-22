@@ -15,12 +15,12 @@
   - Returns full file data as Vec<u8>
 
 ### 2. Complete Restore CLI Command  
-- **CLI interface** (`src/cli/mod.rs`): `SubvolumeCommands::Restore`
+- **CLI interface** (`src/cli/mod.rs`): `DatasetCommands::Restore`
   - `--snapshot`: Snapshot name to restore from
   - `--source`: File path within snapshot
   - `--destination`: Local destination path
 
-- **CLI implementation** (`src/cli/subvolume.rs`): `restore_from_snapshot`
+- **CLI implementation** (`src/cli/dataset.rs`): `restore_from_snapshot`
   - Validates snapshot exists
   - Reads file via RPC
   - Writes to local filesystem
@@ -95,7 +95,7 @@ And similarly for line ~430 (dir_scan key write).
 
 ```
 User CLI Command:
-  zerofs subvolume restore --snapshot X --source path/file.txt --destination /tmp/file.txt
+  zerofs dataset restore --snapshot X --source path/file.txt --destination /tmp/file.txt
         ↓
 RPC Client (client.rs):
   read_snapshot_file(snapshot_name, file_path)

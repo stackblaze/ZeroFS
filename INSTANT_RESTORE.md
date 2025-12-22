@@ -33,7 +33,7 @@ Space: No duplication (COW)
 
 ```bash
 # Restore a file from snapshot
-zerofs subvolume restore \
+zerofs dataset restore \
   --config zerofs.toml \
   --snapshot <snapshot-name> \
   --source <path-in-snapshot> \
@@ -44,13 +44,13 @@ zerofs subvolume restore \
 
 ```bash
 # 1. Take snapshot
-zerofs subvolume snapshot --config zerofs.toml root pvc-backup
+zerofs dataset snapshot --config zerofs.toml root pvc-backup
 
 # 2. File gets deleted accidentally
 rm /mnt/zerofs-nfs/my-pvc/database.db
 
 # 3. Instant restore (0.01s for any size!)
-zerofs subvolume restore \
+zerofs dataset restore \
   --config zerofs.toml \
   --snapshot pvc-backup \
   --source /my-pvc/database.db \
@@ -142,7 +142,7 @@ Perfect for CSI drivers that need:
 - `zerofs/proto/admin.proto`: New `InstantRestoreFile` RPC
 - `zerofs/src/rpc/server.rs`: RPC server implementation
 - `zerofs/src/rpc/client.rs`: RPC client method
-- `zerofs/src/cli/subvolume.rs`: Path detection and CLI logic
+- `zerofs/src/cli/dataset.rs`: Path detection and CLI logic
 - `demo-instant-restore.sh`: Interactive demo script
 
 ## Commit

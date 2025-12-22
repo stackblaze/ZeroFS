@@ -10,7 +10,7 @@ Comprehensive testing completed on **2025-12-21 18:00 UTC**
 - **Improvement**: ~400x faster ⚡
 
 ### Functional Testing Results
-✅ Subvolume creation works  
+✅ Dataset creation works  
 ✅ Snapshot creation works  
 ✅ Multiple rapid snapshots work  
 ✅ Snapshot listing works  
@@ -20,7 +20,7 @@ Comprehensive testing completed on **2025-12-21 18:00 UTC**
 ✅ Range scan correctly finds all directory entries  
 
 ### Snapshots Created in Test Run
-- 1 test subvolume: `test-vol-1766340049` (ID: 22)
+- 1 test dataset: `test-vol-1766340049` (ID: 22)
 - 5 new snapshots successfully created:
   - `snapshot-1766340050` (ID: 23)
   - `snapshot2-1766340051` (ID: 24)
@@ -31,7 +31,7 @@ Comprehensive testing completed on **2025-12-21 18:00 UTC**
 ### System State
 - **27 total snapshots** in the system (including historical)
 - All snapshots have valid UUIDs and timestamps
-- All created from root subvolume (parent ID: 0)
+- All created from root dataset (parent ID: 0)
 - No errors or warnings during creation
 
 ## Technical Implementation
@@ -101,13 +101,13 @@ The snapshot system is production-ready:
 
 ```bash
 # Create snapshot
-zerofs subvolume snapshot -c zerofs.toml root my-snapshot
+zerofs dataset snapshot -c zerofs.toml root my-snapshot
 
 # List snapshots
-zerofs subvolume list-snapshots -c zerofs.toml
+zerofs dataset list-snapshots -c zerofs.toml
 
 # Restore file from snapshot
-zerofs subvolume restore -c zerofs.toml \
+zerofs dataset restore -c zerofs.toml \
   --snapshot my-snapshot \
   --source path/to/file.txt \
   --destination /tmp/restored.txt
@@ -124,7 +124,7 @@ zerofs subvolume restore -c zerofs.toml \
 ## Test Script
 
 The test script is available at `/tmp/test_snapshot_restore.sh` and includes:
-- Subvolume creation
+- Dataset creation
 - Multiple snapshot creation
 - Performance benchmarking
 - Snapshot listing verification
