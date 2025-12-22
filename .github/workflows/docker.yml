@@ -30,24 +30,37 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Download PGO builds
+      - name: Build binaries for Docker
         run: |
-          # Determine which release to download
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            # Use the specific tag
-            TAG="${{ github.ref_name }}"
-            DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/download/${TAG}/zerofs-pgo-multiplatform.tar.gz"
-          else
-            # For PRs and workflow_dispatch, use latest
-            DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/latest/download/zerofs-pgo-multiplatform.tar.gz"
-          fi
-
-          echo "Downloading PGO builds from: $DOWNLOAD_URL"
-
-          curl -fsSL "$DOWNLOAD_URL" | tar xz
-
-          echo "Extracted binaries:"
-          ls -la zerofs-linux-*-pgo
+          # Install Rust
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          
+          # Install cross for easy cross-compilation
+          cargo install cross --git https://github.com/cross-rs/cross
+          
+          # Build for each platform using cross
+          cd zerofs
+          
+          echo "Building for x86_64..."
+          cross build --release --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/zerofs ../zerofs-linux-amd64-pgo
+          
+          echo "Building for aarch64..."
+          cross build --release --target aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/zerofs ../zerofs-linux-arm64-pgo
+          
+          echo "Building for armv7..."
+          cross build --release --target armv7-unknown-linux-musleabihf
+          cp target/armv7-unknown-linux-musleabihf/release/zerofs ../zerofs-linux-armv7-pgo
+          
+          echo "Building for i686..."
+          cross build --release --target i686-unknown-linux-musl
+          cp target/i686-unknown-linux-musl/release/zerofs ../zerofs-linux-386-pgo
+          
+          cd ..
+          echo "Built binaries:"
+          ls -lh zerofs-linux-*-pgo
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
