@@ -1,24 +1,23 @@
 use crate::config::Settings;
-use crate::control::{send_control_request, ControlRequest, ControlResponse};
+use crate::control::{ControlRequest, ControlResponse, send_control_request};
 use anyhow::{Context, Result};
 use comfy_table::{Cell, Color, Table};
 use num_format::{Locale, ToFormattedString};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::fs;
 
 fn get_control_socket_path(config: &PathBuf) -> Result<String> {
     let settings = Settings::from_file(config.to_str().unwrap())
         .with_context(|| format!("Failed to load config from {}", config.display()))?;
-    
+
     let socket_path = settings.cache.dir.join("zerofs.sock");
     Ok(socket_path.to_str().unwrap().to_string())
 }
 
 pub async fn create_device(config: PathBuf, name: String, size: String) -> Result<()> {
     let socket_path = get_control_socket_path(&config)?;
-    let size_bytes = parse_size(&size)
-        .with_context(|| format!("Invalid size format: {}", size))?;
+    let size_bytes = parse_size(&size).with_context(|| format!("Invalid size format: {}", size))?;
 
     let request = ControlRequest::CreateDevice {
         name: name.clone(),
@@ -84,7 +83,10 @@ pub async fn list_devices(config: PathBuf) -> Result<()> {
 
 pub async fn delete_device(config: PathBuf, name: String, force: bool) -> Result<()> {
     if !force {
-        println!("Are you sure you want to delete NBD device '{}'? This cannot be undone.", name);
+        println!(
+            "Are you sure you want to delete NBD device '{}'? This cannot be undone.",
+            name
+        );
         println!("Use --force to skip this confirmation.");
         anyhow::bail!("Deletion cancelled");
     }
@@ -112,8 +114,7 @@ pub async fn delete_device(config: PathBuf, name: String, force: bool) -> Result
 
 pub async fn resize_device(config: PathBuf, name: String, size: String) -> Result<()> {
     let socket_path = get_control_socket_path(&config)?;
-    let size_bytes = parse_size(&size)
-        .with_context(|| format!("Invalid size format: {}", size))?;
+    let size_bytes = parse_size(&size).with_context(|| format!("Invalid size format: {}", size))?;
 
     let request = ControlRequest::ResizeDevice {
         name: name.clone(),
@@ -149,20 +150,22 @@ pub async fn format_device(
     let response = send_control_request(&socket_path, request).await?;
 
     let device_info = match response {
-        ControlResponse::DeviceList { devices } => {
-            devices
-                .into_iter()
-                .find(|d| d.name == name)
-                .ok_or_else(|| anyhow::anyhow!("Device '{}' not found", name))?
-        }
+        ControlResponse::DeviceList { devices } => devices
+            .into_iter()
+            .find(|d| d.name == name)
+            .ok_or_else(|| anyhow::anyhow!("Device '{}' not found", name))?,
         ControlResponse::Error { message } => {
             anyhow::bail!("Failed to list devices: {}", message)
         }
         _ => anyhow::bail!("Unexpected response from server"),
     };
 
-    println!("Formatting device '{}' ({}) with {} filesystem...", 
-             name, format_size(device_info.size), filesystem);
+    println!(
+        "Formatting device '{}' ({}) with {} filesystem...",
+        name,
+        format_size(device_info.size),
+        filesystem
+    );
     println!("(Formatting directly on server - no network overhead)");
 
     // Mount ZeroFS locally to access the device file directly
@@ -171,8 +174,7 @@ pub async fn format_device(
     let device_path = format!("{}/.nbd/{}", mount_point, name);
 
     // Create temporary mount point
-    std::fs::create_dir_all(&mount_point)
-        .context("Failed to create temporary mount point")?;
+    std::fs::create_dir_all(&mount_point).context("Failed to create temporary mount point")?;
 
     // Determine mount method (prefer 9P Unix socket, then 9P TCP, then NFS)
     let mount_result = if let Some(ninep_config) = &settings.servers.ninep {
@@ -188,18 +190,25 @@ pub async fn format_device(
                 .status()
         } else if let Some(ref addrs) = ninep_config.addresses {
             // Mount via 9P TCP
-            let addr = addrs.iter().next()
+            let addr = addrs
+                .iter()
+                .next()
                 .ok_or_else(|| anyhow::anyhow!("No 9P server addresses configured"))?;
             Command::new("mount")
                 .arg("-t")
                 .arg("9p")
                 .arg("-o")
-                .arg(format!("trans=tcp,port={},version=9p2000.L,cache=mmap,access=user", addr.port()))
+                .arg(format!(
+                    "trans=tcp,port={},version=9p2000.L,cache=mmap,access=user",
+                    addr.port()
+                ))
                 .arg("127.0.0.1")
                 .arg(&mount_point)
                 .status()
         } else {
-            anyhow::bail!("No 9P server configured. Please configure 9P or NFS server in zerofs.toml");
+            anyhow::bail!(
+                "No 9P server configured. Please configure 9P or NFS server in zerofs.toml"
+            );
         }
     } else if let Some(_nfs_config) = &settings.servers.nfs {
         // Mount via NFS localhost
@@ -212,15 +221,20 @@ pub async fn format_device(
             .arg(&mount_point)
             .status()
     } else {
-        anyhow::bail!("No file access protocol (9P or NFS) configured. Please configure at least one in zerofs.toml");
+        anyhow::bail!(
+            "No file access protocol (9P or NFS) configured. Please configure at least one in zerofs.toml"
+        );
     };
 
-    let mount_status = mount_result
-        .context("Failed to execute mount command. Make sure you have permission to mount filesystems.")?;
+    let mount_status = mount_result.context(
+        "Failed to execute mount command. Make sure you have permission to mount filesystems.",
+    )?;
 
     if !mount_status.success() {
         let _ = std::fs::remove_dir(&mount_point);
-        anyhow::bail!("Failed to mount ZeroFS locally. Is the server running? You may need sudo privileges.");
+        anyhow::bail!(
+            "Failed to mount ZeroFS locally. Is the server running? You may need sudo privileges."
+        );
     }
 
     // Verify device file exists
@@ -235,7 +249,7 @@ pub async fn format_device(
         "btrfs" => {
             let mut cmd = Command::new("mkfs.btrfs");
             cmd.arg("-f"); // Force formatting
-            
+
             // Add custom options if provided
             if let Some(opts) = &mkfs_options {
                 // Parse options (simple space-separated)
@@ -243,14 +257,17 @@ pub async fn format_device(
                     cmd.arg(opt);
                 }
             }
-            
+
             cmd.arg(&device_path);
             cmd.status()
         }
         _ => {
             let _ = Command::new("umount").arg(&mount_point).status();
             let _ = std::fs::remove_dir(&mount_point);
-            anyhow::bail!("Unsupported filesystem type: {}. Currently only 'btrfs' is supported.", filesystem);
+            anyhow::bail!(
+                "Unsupported filesystem type: {}. Currently only 'btrfs' is supported.",
+                filesystem
+            );
         }
     };
 
@@ -262,43 +279,58 @@ pub async fn format_device(
         .arg(&mount_point)
         .status()
         .context("Failed to unmount ZeroFS")?;
-    
+
     let _ = std::fs::remove_dir(&mount_point);
 
     if !umount_status.success() {
-        eprintln!("Warning: Failed to unmount {}. You may need to unmount manually.", mount_point);
+        eprintln!(
+            "Warning: Failed to unmount {}. You may need to unmount manually.",
+            mount_point
+        );
     }
 
     if !format_status.success() {
         anyhow::bail!("Failed to format device with {} filesystem", filesystem);
     }
 
-    println!("✓ Successfully formatted device '{}' with {} filesystem", name, filesystem);
+    println!(
+        "✓ Successfully formatted device '{}' with {} filesystem",
+        name, filesystem
+    );
     println!("  Device size: {}", format_size(device_info.size));
     println!("  Formatting completed server-side (no network overhead)");
 
     Ok(())
 }
 
-
 fn parse_size(size: &str) -> Result<u64> {
     let size = size.trim().to_uppercase();
-    
+
     // Try to parse as plain number first
     if let Ok(bytes) = size.parse::<u64>() {
         return Ok(bytes);
     }
 
     // Parse with suffix (e.g., "10G", "512M", "1T")
-    let (num_str, suffix) = if size.ends_with("TB") || size.ends_with("GB") || size.ends_with("MB") || size.ends_with("KB") {
+    let (num_str, suffix) = if size.ends_with("TB")
+        || size.ends_with("GB")
+        || size.ends_with("MB")
+        || size.ends_with("KB")
+    {
         size.split_at(size.len() - 2)
-    } else if size.ends_with('T') || size.ends_with('G') || size.ends_with('M') || size.ends_with('K') {
+    } else if size.ends_with('T')
+        || size.ends_with('G')
+        || size.ends_with('M')
+        || size.ends_with('K')
+    {
         size.split_at(size.len() - 1)
     } else {
         anyhow::bail!("Invalid size format. Use formats like: 10G, 512M, 1T, or plain bytes");
     };
 
-    let num: f64 = num_str.trim().parse()
+    let num: f64 = num_str
+        .trim()
+        .parse()
         .context("Invalid number in size specification")?;
 
     let multiplier = match suffix {
@@ -346,7 +378,10 @@ mod tests {
         assert_eq!(parse_size("1GB").unwrap(), 1024 * 1024 * 1024);
         assert_eq!(parse_size("1T").unwrap(), 1024u64 * 1024 * 1024 * 1024);
         assert_eq!(parse_size("1TB").unwrap(), 1024u64 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size("10.5G").unwrap(), (10.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+        assert_eq!(
+            parse_size("10.5G").unwrap(),
+            (10.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
     }
 
     #[test]
@@ -377,26 +412,30 @@ pub async fn export_device(
     let response = send_control_request(&socket_path, request).await?;
 
     let device_info = match response {
-        ControlResponse::DeviceList { devices } => {
-            devices
-                .into_iter()
-                .find(|d| d.name == name)
-                .ok_or_else(|| anyhow::anyhow!("Device '{}' not found", name))?
-        }
+        ControlResponse::DeviceList { devices } => devices
+            .into_iter()
+            .find(|d| d.name == name)
+            .ok_or_else(|| anyhow::anyhow!("Device '{}' not found", name))?,
         ControlResponse::Error { message } => {
             anyhow::bail!("Failed to list devices: {}", message)
         }
         _ => anyhow::bail!("Unexpected response from server"),
     };
 
-    println!("Exporting device '{}' ({}) via NFS...", name, format_size(device_info.size));
+    println!(
+        "Exporting device '{}' ({}) via NFS...",
+        name,
+        format_size(device_info.size)
+    );
 
     // Determine NBD server connection method
     let (host_opt, port_opt, unix_socket_opt) = if let Some(nbd_config) = &settings.servers.nbd {
         if let Some(socket) = &nbd_config.unix_socket {
             (None, None, Some(socket.clone()))
         } else if let Some(addrs) = &nbd_config.addresses {
-            let addr = addrs.iter().next()
+            let addr = addrs
+                .iter()
+                .next()
                 .ok_or_else(|| anyhow::anyhow!("No NBD server addresses configured"))?;
             (Some(addr.ip().to_string()), Some(addr.port()), None)
         } else {
@@ -428,11 +467,14 @@ pub async fn export_device(
             .status()
     };
 
-    let connect_status = connect_result
-        .context("Failed to execute nbd-client. Is it installed?")?;
+    let connect_status =
+        connect_result.context("Failed to execute nbd-client. Is it installed?")?;
 
     if !connect_status.success() {
-        anyhow::bail!("Failed to connect to NBD device '{}'. Is the server running?", name);
+        anyhow::bail!(
+            "Failed to connect to NBD device '{}'. Is the server running?",
+            name
+        );
     }
 
     // Check if device is already formatted
@@ -446,12 +488,13 @@ pub async fn export_device(
         format_nbd_device(&nbd_device, fs, None)?;
         fs.clone()
     } else {
-        anyhow::bail!("Device is not formatted and no filesystem type specified. Use --filesystem to format it.");
+        anyhow::bail!(
+            "Device is not formatted and no filesystem type specified. Use --filesystem to format it."
+        );
     };
 
     // Create mount point
-    fs::create_dir_all(&mount_point)
-        .context("Failed to create mount point")?;
+    fs::create_dir_all(&mount_point).context("Failed to create mount point")?;
 
     // Mount the device
     println!("Mounting device to {}...", mount_point.display());
@@ -464,14 +507,19 @@ pub async fn export_device(
         .context("Failed to execute mount command")?;
 
     if !mount_status.success() {
-        let _ = Command::new("nbd-client").arg("-d").arg(nbd_device.to_str().unwrap()).status();
+        let _ = Command::new("nbd-client")
+            .arg("-d")
+            .arg(nbd_device.to_str().unwrap())
+            .status();
         anyhow::bail!("Failed to mount device");
     }
 
     // Configure NFS export
-    let export_path = nfs_export_path.as_deref().unwrap_or(mount_point.to_str().unwrap());
+    let export_path = nfs_export_path
+        .as_deref()
+        .unwrap_or(mount_point.to_str().unwrap());
     println!("Configuring NFS export: {} ({})", export_path, nfs_options);
-    
+
     add_nfs_export(export_path, &nfs_options)?;
     reload_nfs_exports()?;
 
@@ -480,7 +528,10 @@ pub async fn export_device(
     println!("  NFS export: {}", export_path);
     println!("  Filesystem: {}", fs_type);
     println!("\nClients can mount with:");
-    println!("  mount -t nfs <server-ip>:{} <local-mount-point>", export_path);
+    println!(
+        "  mount -t nfs <server-ip>:{} <local-mount-point>",
+        export_path
+    );
 
     Ok(())
 }
@@ -553,15 +604,16 @@ fn detect_filesystem(device: &Path) -> Result<Option<String>> {
 fn format_nbd_device(device: &Path, filesystem: &str, mkfs_options: Option<&str>) -> Result<()> {
     let mut cmd = Command::new(format!("mkfs.{}", filesystem));
     cmd.arg("-f"); // Force formatting
-    
+
     if let Some(opts) = mkfs_options {
         for opt in opts.split_whitespace() {
             cmd.arg(opt);
         }
     }
-    
+
     cmd.arg(device.to_str().unwrap());
-    let status = cmd.status()
+    let status = cmd
+        .status()
         .with_context(|| format!("Failed to execute mkfs.{}. Is it installed?", filesystem))?;
 
     if !status.success() {
@@ -573,14 +625,13 @@ fn format_nbd_device(device: &Path, filesystem: &str, mkfs_options: Option<&str>
 
 fn add_nfs_export(path: &str, options: &str) -> Result<()> {
     const EXPORTS_FILE: &str = "/etc/exports";
-    
+
     // Read existing exports
-    let content = fs::read_to_string(EXPORTS_FILE)
-        .unwrap_or_else(|_| String::new());
-    
+    let content = fs::read_to_string(EXPORTS_FILE).unwrap_or_else(|_| String::new());
+
     // Format: /path *(options) or /path host(options)
     let export_line = format!("{} *({})", path, options);
-    
+
     // Check if export already exists (check for path)
     if content.lines().any(|line| {
         let trimmed = line.trim();
@@ -607,10 +658,9 @@ fn add_nfs_export(path: &str, options: &str) -> Result<()> {
 
 fn remove_nfs_export(path: &str) -> Result<()> {
     const EXPORTS_FILE: &str = "/etc/exports";
-    
-    let content = fs::read_to_string(EXPORTS_FILE)
-        .context("Failed to read /etc/exports")?;
-    
+
+    let content = fs::read_to_string(EXPORTS_FILE).context("Failed to read /etc/exports")?;
+
     // Remove lines matching this export path (but keep comments)
     let lines: Vec<&str> = content
         .lines()
@@ -624,11 +674,9 @@ fn remove_nfs_export(path: &str) -> Result<()> {
     if !new_content.ends_with('\n') && !new_content.is_empty() {
         let mut final_content = new_content;
         final_content.push('\n');
-        fs::write(EXPORTS_FILE, final_content)
-            .context("Failed to write /etc/exports")?;
+        fs::write(EXPORTS_FILE, final_content).context("Failed to write /etc/exports")?;
     } else {
-        fs::write(EXPORTS_FILE, new_content)
-            .context("Failed to write /etc/exports")?;
+        fs::write(EXPORTS_FILE, new_content).context("Failed to write /etc/exports")?;
     }
 
     Ok(())
@@ -636,9 +684,7 @@ fn remove_nfs_export(path: &str) -> Result<()> {
 
 fn reload_nfs_exports() -> Result<()> {
     // Try exportfs -ra first (works without full NFS server)
-    let status = Command::new("exportfs")
-        .arg("-ra")
-        .status();
+    let status = Command::new("exportfs").arg("-ra").status();
 
     match status {
         Ok(s) if s.success() => {
@@ -693,9 +739,15 @@ pub async fn create_snapshot(
         .output()
         .context("Failed to check filesystem type")?;
 
-    let fs_type = String::from_utf8_lossy(&blkid_output.stdout).trim().to_string();
+    let fs_type = String::from_utf8_lossy(&blkid_output.stdout)
+        .trim()
+        .to_string();
     if fs_type != "btrfs" {
-        anyhow::bail!("Mount point {} is not a BTRFS filesystem (detected: {})", mount_point.display(), fs_type);
+        anyhow::bail!(
+            "Mount point {} is not a BTRFS filesystem (detected: {})",
+            mount_point.display(),
+            fs_type
+        );
     }
 
     // Determine snapshot path
@@ -707,14 +759,12 @@ pub async fn create_snapshot(
 
     // Create .snapshots directory if needed
     if let Some(parent) = snap_path.parent() {
-        fs::create_dir_all(parent)
-            .context("Failed to create snapshot directory")?;
+        fs::create_dir_all(parent).context("Failed to create snapshot directory")?;
     }
 
     // Create snapshot
     let mut cmd = Command::new("btrfs");
-    cmd.arg("dataset")
-        .arg("snapshot");
+    cmd.arg("dataset").arg("snapshot");
 
     if read_only {
         cmd.arg("-r"); // Read-only snapshot
@@ -723,25 +773,26 @@ pub async fn create_snapshot(
     cmd.arg(mount_point.to_str().unwrap())
         .arg(snap_path.to_str().unwrap());
 
-    let status = cmd.status()
+    let status = cmd
+        .status()
         .context("Failed to execute btrfs command. Is btrfs-progs installed?")?;
 
     if !status.success() {
         anyhow::bail!("Failed to create snapshot");
     }
 
-    println!("✓ Created {} snapshot: {}", if read_only { "read-only" } else { "read-write" }, snap_path.display());
+    println!(
+        "✓ Created {} snapshot: {}",
+        if read_only { "read-only" } else { "read-write" },
+        snap_path.display()
+    );
     println!("  Source: {}", mount_point.display());
     println!("  Snapshot: {}", snap_path.display());
 
     Ok(())
 }
 
-pub async fn list_snapshots(
-    _config: PathBuf,
-    _name: String,
-    mount_point: PathBuf,
-) -> Result<()> {
+pub async fn list_snapshots(_config: PathBuf, _name: String, mount_point: PathBuf) -> Result<()> {
     // Verify mount point exists and is a BTRFS filesystem
     if !mount_point.exists() {
         anyhow::bail!("Mount point {} does not exist", mount_point.display());
@@ -784,7 +835,7 @@ pub async fn list_snapshots(
             let generation = parts[1];
             let path = parts[parts.len() - 1];
             let read_only = if line.contains("ro") { "Yes" } else { "No" };
-            
+
             table.add_row(vec![
                 Cell::new(id),
                 Cell::new(generation),
@@ -831,7 +882,11 @@ pub async fn restore_snapshot(
         mount_point.clone()
     };
 
-    println!("Restoring snapshot {} to {}...", snap_path.display(), target.display());
+    println!(
+        "Restoring snapshot {} to {}...",
+        snap_path.display(),
+        target.display()
+    );
     println!("⚠ Warning: This will replace the target with snapshot contents!");
 
     // For BTRFS, we can either:
@@ -841,11 +896,11 @@ pub async fn restore_snapshot(
 
     // Check if target is the root of the filesystem (can't delete root dataset)
     let is_root = target == mount_point;
-    
+
     if is_root {
         // For root restore, use rsync to copy contents
         println!("Restoring to root filesystem, copying contents...");
-        
+
         let rsync_status = Command::new("rsync")
             .arg("-a")
             .arg("--delete")
@@ -872,7 +927,7 @@ pub async fn restore_snapshot(
         if is_dataset {
             // Delete target dataset and create new snapshot
             println!("Target is a dataset, deleting and recreating...");
-            
+
             // Delete target
             let delete_status = Command::new("btrfs")
                 .arg("dataset")
@@ -900,7 +955,7 @@ pub async fn restore_snapshot(
         } else {
             // Use rsync to copy contents (safer for regular directories)
             println!("Target is a regular directory, copying contents...");
-            
+
             let rsync_status = Command::new("rsync")
                 .arg("-a")
                 .arg("--delete")
@@ -963,4 +1018,3 @@ pub async fn delete_snapshot(
 
     Ok(())
 }
-

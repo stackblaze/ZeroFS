@@ -1,9 +1,9 @@
+use crate::fs::dataset::Dataset;
 /// Virtual filesystem layer for exposing snapshots as subdirectories
 /// This makes snapshots accessible at /.snapshots/<snapshot-name>/
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, Inode, InodeId};
 use crate::fs::store::DatasetStore;
-use crate::fs::dataset::Dataset;
 
 /// Special inode ID for the .snapshots directory
 /// We use a very high ID that won't conflict with regular inodes
@@ -55,11 +55,14 @@ impl SnapshotVfs {
     /// Look up an entry in the .snapshots directory
     pub async fn lookup_in_snapshots(&self, name: &[u8]) -> Result<InodeId, FsError> {
         let name_str = std::str::from_utf8(name).map_err(|_| FsError::InvalidArgument)?;
-        
+
         // Find the snapshot by name
-        let snapshot = self.dataset_store.get_by_name(name_str).await
+        let snapshot = self
+            .dataset_store
+            .get_by_name(name_str)
+            .await
             .ok_or(FsError::NotFound)?;
-        
+
         // Only allow access to actual snapshots, not regular datasets
         if !snapshot.is_snapshot {
             return Err(FsError::NotFound);
@@ -82,7 +85,7 @@ impl SnapshotVfs {
             uid: 0,
             gid: 0,
             entry_count: 0, // Will be computed dynamically
-            parent: 0, // Root directory
+            parent: 0,      // Root directory
             name: Some(b".snapshots".to_vec()),
             nlink: 2,
         })
@@ -90,7 +93,10 @@ impl SnapshotVfs {
 
     /// Get the virtual inode for a snapshot directory
     pub async fn get_snapshot_dir_inode(&self, snapshot_id: u64) -> Result<Inode, FsError> {
-        let snapshot = self.dataset_store.get_by_id(snapshot_id).await
+        let snapshot = self
+            .dataset_store
+            .get_by_id(snapshot_id)
+            .await
             .ok_or(FsError::NotFound)?;
 
         if !snapshot.is_snapshot {
@@ -119,7 +125,10 @@ impl SnapshotVfs {
 
     /// Get the actual root inode ID for a snapshot
     pub async fn get_snapshot_root_inode(&self, snapshot_id: u64) -> Result<InodeId, FsError> {
-        let snapshot = self.dataset_store.get_by_id(snapshot_id).await
+        let snapshot = self
+            .dataset_store
+            .get_by_id(snapshot_id)
+            .await
             .ok_or(FsError::NotFound)?;
 
         if !snapshot.is_snapshot {
@@ -166,4 +175,3 @@ mod tests {
         assert!(!SnapshotVfs::is_snapshots_name(b".snapshot"));
     }
 }
-

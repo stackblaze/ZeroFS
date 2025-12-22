@@ -3,12 +3,12 @@ use std::path::PathBuf;
 
 pub mod checkpoint;
 pub mod compactor;
+pub mod dataset;
 pub mod debug;
 pub mod fatrace;
 pub mod nbd;
 pub mod password;
 pub mod server;
-pub mod dataset;
 
 #[derive(Parser)]
 #[command(name = "zerofs")]

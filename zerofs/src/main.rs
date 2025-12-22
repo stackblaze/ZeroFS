@@ -112,32 +112,104 @@ async fn main() -> Result<()> {
             cli::NbdCommands::List { config } => {
                 cli::nbd::list_devices(config).await?;
             }
-            cli::NbdCommands::Delete { config, name, force } => {
+            cli::NbdCommands::Delete {
+                config,
+                name,
+                force,
+            } => {
                 cli::nbd::delete_device(config, name, force).await?;
             }
             cli::NbdCommands::Resize { config, name, size } => {
                 cli::nbd::resize_device(config, name, size).await?;
             }
-            cli::NbdCommands::Format { config, name, filesystem, mkfs_options } => {
+            cli::NbdCommands::Format {
+                config,
+                name,
+                filesystem,
+                mkfs_options,
+            } => {
                 cli::nbd::format_device(config, name, filesystem, mkfs_options).await?;
             }
-            cli::NbdCommands::Export { config, name, mount_point, nbd_device, filesystem, nfs_export_path, nfs_options } => {
-                cli::nbd::export_device(config, name, mount_point, nbd_device, filesystem, nfs_export_path, nfs_options).await?;
+            cli::NbdCommands::Export {
+                config,
+                name,
+                mount_point,
+                nbd_device,
+                filesystem,
+                nfs_export_path,
+                nfs_options,
+            } => {
+                cli::nbd::export_device(
+                    config,
+                    name,
+                    mount_point,
+                    nbd_device,
+                    filesystem,
+                    nfs_export_path,
+                    nfs_options,
+                )
+                .await?;
             }
-            cli::NbdCommands::Unexport { config, name, mount_point, nbd_device } => {
+            cli::NbdCommands::Unexport {
+                config,
+                name,
+                mount_point,
+                nbd_device,
+            } => {
                 cli::nbd::unexport_device(config, name, mount_point, nbd_device).await?;
             }
-            cli::NbdCommands::Snapshot { config, name, mount_point, snapshot_name, snapshot_path, read_only } => {
-                cli::nbd::create_snapshot(config, name, mount_point, snapshot_name, snapshot_path, read_only).await?;
+            cli::NbdCommands::Snapshot {
+                config,
+                name,
+                mount_point,
+                snapshot_name,
+                snapshot_path,
+                read_only,
+            } => {
+                cli::nbd::create_snapshot(
+                    config,
+                    name,
+                    mount_point,
+                    snapshot_name,
+                    snapshot_path,
+                    read_only,
+                )
+                .await?;
             }
-            cli::NbdCommands::Snapshots { config, name, mount_point } => {
+            cli::NbdCommands::Snapshots {
+                config,
+                name,
+                mount_point,
+            } => {
                 cli::nbd::list_snapshots(config, name, mount_point).await?;
             }
-            cli::NbdCommands::Restore { config, name, mount_point, snapshot_name, snapshot_path, target_path } => {
-                cli::nbd::restore_snapshot(config, name, mount_point, snapshot_name, snapshot_path, target_path).await?;
+            cli::NbdCommands::Restore {
+                config,
+                name,
+                mount_point,
+                snapshot_name,
+                snapshot_path,
+                target_path,
+            } => {
+                cli::nbd::restore_snapshot(
+                    config,
+                    name,
+                    mount_point,
+                    snapshot_name,
+                    snapshot_path,
+                    target_path,
+                )
+                .await?;
             }
-            cli::NbdCommands::DeleteSnapshot { config, name, mount_point, snapshot_name, snapshot_path } => {
-                cli::nbd::delete_snapshot(config, name, mount_point, snapshot_name, snapshot_path).await?;
+            cli::NbdCommands::DeleteSnapshot {
+                config,
+                name,
+                mount_point,
+                snapshot_name,
+                snapshot_path,
+            } => {
+                cli::nbd::delete_snapshot(config, name, mount_point, snapshot_name, snapshot_path)
+                    .await?;
             }
         },
         cli::Commands::Dataset { subcommand } => match subcommand {
@@ -153,7 +225,12 @@ async fn main() -> Result<()> {
             cli::DatasetCommands::Info { config, name } => {
                 cli::dataset::get_dataset_info(&config, &name).await?;
             }
-            cli::DatasetCommands::Snapshot { config, source, name, readonly } => {
+            cli::DatasetCommands::Snapshot {
+                config,
+                source,
+                name,
+                readonly,
+            } => {
                 cli::dataset::create_snapshot(&config, &source, &name, readonly).await?;
             }
             cli::DatasetCommands::ListSnapshots { config } => {
@@ -168,8 +245,14 @@ async fn main() -> Result<()> {
             cli::DatasetCommands::GetDefault { config } => {
                 cli::dataset::get_default_dataset(&config).await?;
             }
-            cli::DatasetCommands::Restore { config, snapshot, source, destination } => {
-                cli::dataset::restore_from_snapshot(&config, &snapshot, &source, &destination).await?;
+            cli::DatasetCommands::Restore {
+                config,
+                snapshot,
+                source,
+                destination,
+            } => {
+                cli::dataset::restore_from_snapshot(&config, &snapshot, &source, &destination)
+                    .await?;
             }
         },
         cli::Commands::Fatrace { config } => {

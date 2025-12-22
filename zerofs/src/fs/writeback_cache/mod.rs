@@ -7,8 +7,8 @@ use crate::fs::errors::FsError;
 use anyhow::Result;
 use dashmap::DashMap;
 use slatedb::WriteBatch;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
@@ -80,9 +80,7 @@ pub enum FlushSignal {
 }
 
 impl WritebackCache {
-    pub fn new(
-        max_bytes: u64,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<FlushSignal>)> {
+    pub fn new(max_bytes: u64) -> Result<(Self, mpsc::UnboundedReceiver<FlushSignal>)> {
         let stats = Arc::new(WritebackStats::new());
         let (flush_tx, flush_rx) = mpsc::unbounded_channel();
 
@@ -100,7 +98,7 @@ impl WritebackCache {
 
     pub async fn write(&self, batch: WriteBatch) -> Result<TxnId, FsError> {
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
-        
+
         // Estimate batch size - use approximate size
         // Since we can't access WriteBatch internals, estimate based on common patterns
         let size_bytes = 1000; // Conservative estimate for a batch
@@ -164,7 +162,10 @@ impl WritebackCache {
             )
             .await
             .map_err(|e| {
-                error!("Failed to flush transaction {} to backend: {}", cached.id, e);
+                error!(
+                    "Failed to flush transaction {} to backend: {}",
+                    cached.id, e
+                );
                 FsError::IoError
             })?;
 
@@ -198,4 +199,3 @@ impl WritebackCache {
         let _ = self.flush_tx.send(FlushSignal::Manual);
     }
 }
-

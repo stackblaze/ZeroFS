@@ -1,7 +1,7 @@
 use crate::config::Settings;
 use crate::rpc::client::RpcClient;
 use anyhow::{Context, Result};
-use comfy_table::{presets::UTF8_FULL, Table};
+use comfy_table::{Table, presets::UTF8_FULL};
 use std::path::Path;
 
 async fn connect_rpc_client(config_path: &Path) -> Result<RpcClient> {
@@ -70,14 +70,7 @@ pub async fn list_datasets(config_path: &Path) -> Result<()> {
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(vec![
-        "ID",
-        "Name",
-        "UUID",
-        "Created At",
-        "Type",
-        "Readonly",
-    ]);
+    table.set_header(vec!["ID", "Name", "UUID", "Created At", "Type", "Readonly"]);
 
     for subvol in datasets {
         let sv_type = if subvol.is_snapshot {
@@ -85,7 +78,7 @@ pub async fn list_datasets(config_path: &Path) -> Result<()> {
         } else {
             "Dataset"
         };
-        
+
         table.add_row(vec![
             subvol.id.to_string(),
             subvol.name,
@@ -121,16 +114,23 @@ pub async fn get_dataset_info(config_path: &Path, name: &str) -> Result<()> {
     println!("  Name: {}", dataset.name);
     println!("  ID: {}", dataset.id);
     println!("  UUID: {}", dataset.uuid);
-    println!("  Type: {}", if dataset.is_snapshot { "Snapshot" } else { "Dataset" });
+    println!(
+        "  Type: {}",
+        if dataset.is_snapshot {
+            "Snapshot"
+        } else {
+            "Dataset"
+        }
+    );
     println!("  Readonly: {}", dataset.is_readonly);
     println!("  Created at: {}", format_timestamp(dataset.created_at));
     println!("  Root inode: {}", dataset.root_inode);
     println!("  Generation: {}", dataset.generation);
-    
+
     if let Some(parent_id) = dataset.parent_id {
         println!("  Parent ID: {}", parent_id);
     }
-    
+
     if let Some(parent_uuid) = dataset.parent_uuid {
         println!("  Parent UUID: {}", parent_uuid);
     }
@@ -139,9 +139,16 @@ pub async fn get_dataset_info(config_path: &Path, name: &str) -> Result<()> {
 }
 
 /// Create a snapshot
-pub async fn create_snapshot(config_path: &Path, source_name: &str, snapshot_name: &str, readonly: bool) -> Result<()> {
+pub async fn create_snapshot(
+    config_path: &Path,
+    source_name: &str,
+    snapshot_name: &str,
+    readonly: bool,
+) -> Result<()> {
     let client = connect_rpc_client(config_path).await?;
-    let snapshot = client.create_snapshot_with_options(source_name, snapshot_name, readonly).await?;
+    let snapshot = client
+        .create_snapshot_with_options(source_name, snapshot_name, readonly)
+        .await?;
 
     println!("✓ Snapshot created successfully!");
     println!("  Name: {}", snapshot.name);
@@ -149,7 +156,7 @@ pub async fn create_snapshot(config_path: &Path, source_name: &str, snapshot_nam
     println!("  UUID: {}", snapshot.uuid);
     println!("  Source: {}", source_name);
     println!("  Created at: {}", format_timestamp(snapshot.created_at));
-    
+
     if let Some(parent_uuid) = snapshot.parent_uuid {
         println!("  Parent UUID: {}", parent_uuid);
     }
@@ -169,26 +176,24 @@ pub async fn list_snapshots(config_path: &Path) -> Result<()> {
 
     // Get all datasets to map IDs to names
     let datasets = client.list_datasets().await?;
-    let mut id_to_name: std::collections::HashMap<u64, String> = datasets
-        .into_iter()
-        .map(|s| (s.id, s.name))
-        .collect();
+    let mut id_to_name: std::collections::HashMap<u64, String> =
+        datasets.into_iter().map(|s| (s.id, s.name)).collect();
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(vec![
-        "ID",
-        "Name",
-        "Source",
-        "UUID",
-        "Created At",
-    ]);
+    table.set_header(vec!["ID", "Name", "Source", "UUID", "Created At"]);
 
     for snapshot in snapshots {
-        let source = snapshot.parent_id
+        let source = snapshot
+            .parent_id
             .and_then(|id| id_to_name.get(&id).cloned())
-            .unwrap_or_else(|| snapshot.parent_id.map(|id| format!("ID:{}", id)).unwrap_or_else(|| "-".to_string()));
-        
+            .unwrap_or_else(|| {
+                snapshot
+                    .parent_id
+                    .map(|id| format!("ID:{}", id))
+                    .unwrap_or_else(|| "-".to_string())
+            });
+
         table.add_row(vec![
             snapshot.id.to_string(),
             snapshot.name,
@@ -240,35 +245,27 @@ pub async fn get_default_dataset(config_path: &Path) -> Result<()> {
 ///   - /home/user/file.txt                       (outside ZeroFS, on local filesystem)
 fn is_internal_zerofs_path(destination_path: &str) -> bool {
     use std::path::Path;
-    
+
     // For instant restore to work, the destination must be:
     // 1. An absolute path starting with /
     // 2. NOT a path on the local filesystem outside ZeroFS
-    
+
     if !destination_path.starts_with('/') {
         return false;
     }
-    
+
     // Paths that are definitely EXTERNAL (local filesystem):
     let external_prefixes = [
-        "/tmp/",
-        "/home/",
-        "/root/",
-        "/opt/",
-        "/usr/",
-        "/etc/",
-        "/boot/",
-        "/sys/",
-        "/proc/",
+        "/tmp/", "/home/", "/root/", "/opt/", "/usr/", "/etc/", "/boot/", "/sys/", "/proc/",
         "/dev/",
     ];
-    
+
     for prefix in &external_prefixes {
         if destination_path.starts_with(prefix) {
             return false; // External path, use copy-based restore
         }
     }
-    
+
     // All other absolute paths are considered internal to ZeroFS
     // This includes:
     // - /file.txt (root of ZeroFS)
@@ -287,38 +284,45 @@ pub async fn restore_from_snapshot(
 ) -> Result<()> {
     use std::fs;
     use std::io::Write;
-    
+
     let client = connect_rpc_client(config_path).await?;
-    
+
     // Get snapshot info to verify it exists
-    let snapshot = client.get_dataset_info(snapshot_name).await?
+    let snapshot = client
+        .get_dataset_info(snapshot_name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Snapshot '{}' not found", snapshot_name))?;
-    
+
     if !snapshot.is_snapshot {
         anyhow::bail!("'{}' is not a snapshot", snapshot_name);
     }
-    
+
     println!("📸 Restoring from snapshot: {}", snapshot_name);
     println!("   Created: {}", format_timestamp(snapshot.created_at));
     println!("   Source path: {}", source_path);
     println!("   Destination: {}", destination_path);
     println!();
-    
+
     // Check if destination is internal to ZeroFS filesystem
     // For Kubernetes CSI, paths will be absolute paths like /var/lib/kubelet/pods/.../volumes/...
     // For direct use, paths will be like /file.txt or /data/file.txt (relative to ZeroFS root)
     let use_instant_restore = is_internal_zerofs_path(destination_path);
-    
+
     if use_instant_restore {
         // INSTANT RESTORE: Create directory entry pointing to snapshot inode (COW)
         print!("⚡ Instant restore (COW - no data copying)...");
         std::io::stdout().flush()?;
-        
+
         let (inode_id, file_size, nlink) = client
             .instant_restore_file(snapshot_name, source_path, destination_path)
             .await
-            .with_context(|| format!("Failed to instant restore file '{}' from snapshot", source_path))?;
-        
+            .with_context(|| {
+                format!(
+                    "Failed to instant restore file '{}' from snapshot",
+                    source_path
+                )
+            })?;
+
         println!(" done!");
         println!();
         println!("✅ File restored instantly (COW)!");
@@ -330,27 +334,28 @@ pub async fn restore_from_snapshot(
         // COPY-BASED RESTORE: For external destinations (outside ZeroFS)
         print!("⏳ Reading file from snapshot...");
         std::io::stdout().flush()?;
-        
+
         // Read the file from the snapshot via RPC
-        let file_data = client.read_snapshot_file(snapshot_name, source_path).await
+        let file_data = client
+            .read_snapshot_file(snapshot_name, source_path)
+            .await
             .with_context(|| format!("Failed to read file '{}' from snapshot", source_path))?;
-        
+
         println!(" done! ({} bytes)", file_data.len());
-        
+
         print!("⏳ Writing to destination...");
         std::io::stdout().flush()?;
-        
+
         // Write to destination
         fs::write(destination_path, &file_data)
             .with_context(|| format!("Failed to write to destination '{}'", destination_path))?;
-        
+
         println!(" done!");
         println!();
         println!("✅ File restored successfully!");
         println!("   Size: {}", format_size(file_data.len() as u64));
         println!("   Note: Data copied (destination outside ZeroFS)");
     }
-    
+
     Ok(())
 }
-

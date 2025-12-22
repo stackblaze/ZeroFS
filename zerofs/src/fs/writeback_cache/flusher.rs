@@ -22,7 +22,8 @@ impl WritebackFlusher {
         flush_threshold_percent: u8,
         max_bytes: u64,
     ) -> Self {
-        let flush_threshold_bytes = (max_bytes as f64 * (flush_threshold_percent as f64 / 100.0)) as u64;
+        let flush_threshold_bytes =
+            (max_bytes as f64 * (flush_threshold_percent as f64 / 100.0)) as u64;
 
         Self {
             cache,
@@ -132,4 +133,3 @@ impl WritebackFlusher {
         Ok(())
     }
 }
-

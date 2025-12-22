@@ -1,3 +1,4 @@
+pub mod dataset;
 pub mod errors;
 pub mod flush_coordinator;
 pub mod gc;
@@ -6,14 +7,13 @@ pub mod key_codec;
 pub mod lock_manager;
 pub mod metrics;
 pub mod permissions;
+pub mod snapshot_manager;
+pub mod snapshot_vfs;
 pub mod stats;
 pub mod store;
 pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
-pub mod dataset;
-pub mod snapshot_manager;
-pub mod snapshot_vfs;
 pub mod writeback_cache;
 
 use self::flush_coordinator::FlushCoordinator;
@@ -22,7 +22,7 @@ use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::snapshot_vfs::SnapshotVfs;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
-use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore, DatasetStore};
+use self::store::{ChunkStore, DatasetStore, DirectoryStore, InodeStore, TombstoneStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
 use self::writeback_cache::WritebackCache;
@@ -194,12 +194,12 @@ impl ZeroFS {
         let directory_store = DirectoryStore::new(db.clone());
         let inode_store = InodeStore::new(db.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone());
-        
+
         // Initialize dataset store
         let (created_sec, _) = get_current_time();
         let dataset_store = DatasetStore::new(db.clone(), ROOT_INODE_ID, created_sec).await?;
         let dataset_store_arc = Arc::new(dataset_store.clone());
-        
+
         // Initialize snapshot VFS
         let snapshot_vfs = Arc::new(SnapshotVfs::new(dataset_store));
 
@@ -233,7 +233,7 @@ impl ZeroFS {
             let (now_sec, _) = get_current_time();
             return Ok(self.snapshot_vfs.get_snapshots_dir_inode(now_sec));
         }
-        
+
         // Regular inodes - get from store
         self.inode_store.get(id).await
     }

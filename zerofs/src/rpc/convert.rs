@@ -187,7 +187,11 @@ impl TryFrom<proto::DatasetInfo> for Dataset {
             name: proto.name,
             uuid: Uuid::parse_str(&proto.uuid)?,
             parent_id: proto.parent_id,
-            parent_uuid: proto.parent_uuid.as_ref().map(|s| Uuid::parse_str(s)).transpose()?,
+            parent_uuid: proto
+                .parent_uuid
+                .as_ref()
+                .map(|s| Uuid::parse_str(s))
+                .transpose()?,
             root_inode: proto.root_inode,
             created_at: proto.created_at,
             is_readonly: proto.is_readonly,

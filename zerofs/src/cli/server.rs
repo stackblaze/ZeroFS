@@ -220,7 +220,12 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, snapshot_manager, tracer, fs.clone());
+    let service = crate::rpc::server::AdminRpcServer::new(
+        checkpoint_manager,
+        snapshot_manager,
+        tracer,
+        fs.clone(),
+    );
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -653,20 +658,28 @@ async fn initialize_filesystem(
         settings.compression(),
     )
     .await?;
-    
+
     // Initialize writeback cache if enabled
-    let writeback_flusher = if !db_mode.is_read_only() && settings.writeback.as_ref().map(|w| w.enabled).unwrap_or(false) {
+    let writeback_flusher = if !db_mode.is_read_only()
+        && settings
+            .writeback
+            .as_ref()
+            .map(|w| w.enabled)
+            .unwrap_or(false)
+    {
         let wb_config = settings.writeback.as_ref().unwrap();
-        info!("Initializing writeback cache: size={}MB", 
-            (wb_config.max_bytes() / 1_000_000));
-        
-        let (wb_cache, flush_rx) = crate::fs::writeback_cache::WritebackCache::new(
-            wb_config.max_bytes(),
-        ).map_err(|e| anyhow::anyhow!("Failed to initialize writeback cache: {}", e))?;
-        
+        info!(
+            "Initializing writeback cache: size={}MB",
+            (wb_config.max_bytes() / 1_000_000)
+        );
+
+        let (wb_cache, flush_rx) =
+            crate::fs::writeback_cache::WritebackCache::new(wb_config.max_bytes())
+                .map_err(|e| anyhow::anyhow!("Failed to initialize writeback cache: {}", e))?;
+
         let wb_cache = Arc::new(wb_cache);
         fs.writeback_cache = Some(Arc::clone(&wb_cache));
-        
+
         info!("Writeback cache initialized successfully");
         Some((wb_cache, flush_rx))
     } else {
@@ -742,7 +755,7 @@ pub async fn run_server(
     }
 
     let shutdown = CancellationToken::new();
-    
+
     // Start writeback flusher if enabled
     let writeback_handle = if let Some((wb_cache, flush_rx)) = init_result.writeback_flusher {
         let wb_config = settings.writeback.as_ref().unwrap();
@@ -789,7 +802,8 @@ pub async fn run_server(
         let control_socket = settings.cache.dir.join("zerofs.sock");
         let control_socket_str = control_socket.to_str().unwrap().to_string();
         info!("Starting control server on {}", control_socket_str);
-        let control_server = crate::control::ControlServer::new(Arc::clone(&fs), control_socket_str);
+        let control_server =
+            crate::control::ControlServer::new(Arc::clone(&fs), control_socket_str);
         Some(tokio::spawn(async move {
             if let Err(e) = control_server.run().await {
                 error!("Control server error: {}", e);
@@ -804,7 +818,7 @@ pub async fn run_server(
         slatedb::object_store::path::Path::from(init_result.db_path),
         init_result.object_store,
     ));
-    
+
     // Create snapshot manager
     let snapshot_manager = Arc::new(crate::fs::snapshot_manager::SnapshotManager::new(
         fs.db.clone(),
@@ -812,7 +826,7 @@ pub async fn run_server(
         (*fs.dataset_store).clone(),
         fs.directory_store.clone(),
     ));
-    
+
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
@@ -905,7 +919,7 @@ pub async fn run_server(
     {
         tracing::error!("Final flush failed: {:?}", e);
     }
-    
+
     // Final writeback cache flush
     if let Some(ref wb_cache) = fs.writeback_cache {
         info!("Performing final writeback cache flush...");

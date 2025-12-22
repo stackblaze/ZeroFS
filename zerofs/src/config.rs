@@ -141,24 +141,24 @@ impl FilesystemConfig {
             .map(|gb| (gb * 1_000_000_000.0) as u64)
             .unwrap_or(u64::MAX)
     }
-    
+
     pub fn chunk_size(&self) -> usize {
         const DEFAULT_CHUNK_SIZE_KB: usize = 32; // Default to 32KB to match existing data
         const MIN_CHUNK_SIZE_KB: usize = 32;
         const MAX_CHUNK_SIZE_KB: usize = 1024;
-        
+
         let size_kb = self.chunk_size_kb.unwrap_or(DEFAULT_CHUNK_SIZE_KB);
-        
+
         // Validate range
         let size_kb = size_kb.clamp(MIN_CHUNK_SIZE_KB, MAX_CHUNK_SIZE_KB);
-        
+
         // Ensure power of 2
         let size_kb = if size_kb.is_power_of_two() {
             size_kb
         } else {
             size_kb.next_power_of_two()
         };
-        
+
         size_kb * 1024 // Convert to bytes
     }
 }
@@ -613,7 +613,9 @@ impl Settings {
         toml_string.push_str("# cache_size_gb = 20.0              # Maximum cache size in GB\n");
         toml_string.push_str("# flush_interval_secs = 5           # Flush to S3 every N seconds (default: 5, min: 1)\n");
         toml_string.push_str("# flush_threshold_percent = 80      # Flush when cache is N% full (default: 80, range: 10-100)\n");
-        toml_string.push_str("# sync_on_write = true              # fsync after each WAL write (default: true)\n");
+        toml_string.push_str(
+            "# sync_on_write = true              # fsync after each WAL write (default: true)\n",
+        );
 
         toml_string.push_str("\n# Optional Azure settings can be added to [azure] section\n");
 

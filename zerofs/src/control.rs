@@ -1,11 +1,11 @@
 // Control protocol for CLI to communicate with running server
+use crate::fs::ZeroFS;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use crate::fs::ZeroFS;
-use std::sync::Arc;
-use tracing::{info, error};
+use tracing::{error, info};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ControlRequest {
@@ -72,33 +72,34 @@ impl ControlServer {
 async fn handle_connection(mut stream: UnixStream, fs: Arc<ZeroFS>) -> Result<()> {
     // Read request length (4 bytes)
     let len = stream.read_u32().await? as usize;
-    
+
     // Read request data
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    
+
     let request: ControlRequest = serde_json::from_slice(&buf)?;
-    
+
     let response = match request {
         ControlRequest::Ping => ControlResponse::Pong,
         ControlRequest::CreateDevice { name, size } => {
             match create_device_internal(&fs, &name, size).await {
                 Ok(inode) => ControlResponse::Success {
-                    message: format!("Created device '{}' (inode: {}, size: {} bytes)", name, inode, size),
+                    message: format!(
+                        "Created device '{}' (inode: {}, size: {} bytes)",
+                        name, inode, size
+                    ),
                 },
                 Err(e) => ControlResponse::Error {
                     message: format!("Failed to create device: {}", e),
                 },
             }
         }
-        ControlRequest::ListDevices => {
-            match list_devices_internal(&fs).await {
-                Ok(devices) => ControlResponse::DeviceList { devices },
-                Err(e) => ControlResponse::Error {
-                    message: format!("Failed to list devices: {}", e),
-                },
-            }
-        }
+        ControlRequest::ListDevices => match list_devices_internal(&fs).await {
+            Ok(devices) => ControlResponse::DeviceList { devices },
+            Err(e) => ControlResponse::Error {
+                message: format!("Failed to list devices: {}", e),
+            },
+        },
         ControlRequest::DeleteDevice { name, force } => {
             match delete_device_internal(&fs, &name, force).await {
                 Ok(_) => ControlResponse::Success {
@@ -120,13 +121,13 @@ async fn handle_connection(mut stream: UnixStream, fs: Arc<ZeroFS>) -> Result<()
             }
         }
     };
-    
+
     // Send response
     let response_bytes = serde_json::to_vec(&response)?;
     stream.write_u32(response_bytes.len() as u32).await?;
     stream.write_all(&response_bytes).await?;
     stream.flush().await?;
-    
+
     Ok(())
 }
 
@@ -157,7 +158,11 @@ async fn create_device_internal(fs: &ZeroFS, name: &str, size: u64) -> Result<u6
     };
 
     // Check if device already exists
-    if fs.lookup(&creds, nbd_dir_inode, name.as_bytes()).await.is_ok() {
+    if fs
+        .lookup(&creds, nbd_dir_inode, name.as_bytes())
+        .await
+        .is_ok()
+    {
         anyhow::bail!("Device '{}' already exists", name);
     }
 
@@ -169,15 +174,17 @@ async fn create_device_internal(fs: &ZeroFS, name: &str, size: u64) -> Result<u6
         ..Default::default()
     };
 
-    let (device_inode, _) = fs.create(&creds, nbd_dir_inode, name.as_bytes(), &attr).await?;
-    
+    let (device_inode, _) = fs
+        .create(&creds, nbd_dir_inode, name.as_bytes(), &attr)
+        .await?;
+
     // Set the size (create always creates files with size 0)
     let size_attr = SetAttributes {
         size: SetSize::Set(size),
         ..Default::default()
     };
     fs.setattr(&creds, device_inode, &size_attr).await?;
-    
+
     // Flush to ensure persistence
     fs.flush_coordinator.flush().await?;
 
@@ -185,8 +192,8 @@ async fn create_device_internal(fs: &ZeroFS, name: &str, size: u64) -> Result<u6
 }
 
 async fn list_devices_internal(fs: &ZeroFS) -> Result<Vec<DeviceInfo>> {
-    use crate::fs::types::AuthContext;
     use crate::fs::inode::Inode;
+    use crate::fs::types::AuthContext;
 
     let auth = AuthContext {
         uid: 0,
@@ -244,7 +251,7 @@ async fn delete_device_internal(fs: &ZeroFS, name: &str, _force: bool) -> Result
         gids: vec![],
     };
     fs.remove(&auth, nbd_dir_inode, name.as_bytes()).await?;
-    
+
     // Flush to ensure persistence
     fs.flush_coordinator.flush().await?;
 
@@ -275,7 +282,7 @@ async fn resize_device_internal(fs: &ZeroFS, name: &str, new_size: u64) -> Resul
     };
 
     fs.setattr(&creds, device_inode, &attr).await?;
-    
+
     // Flush to ensure persistence
     fs.flush_coordinator.flush().await?;
 
@@ -283,25 +290,28 @@ async fn resize_device_internal(fs: &ZeroFS, name: &str, new_size: u64) -> Resul
 }
 
 // Client functions
-pub async fn send_control_request(socket_path: &str, request: ControlRequest) -> Result<ControlResponse> {
-    let mut stream = UnixStream::connect(socket_path).await
+pub async fn send_control_request(
+    socket_path: &str,
+    request: ControlRequest,
+) -> Result<ControlResponse> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
         .context("Failed to connect to control socket. Is the server running?")?;
-    
+
     // Send request
     let request_bytes = serde_json::to_vec(&request)?;
     stream.write_u32(request_bytes.len() as u32).await?;
     stream.write_all(&request_bytes).await?;
     stream.flush().await?;
-    
+
     // Read response length
     let len = stream.read_u32().await? as usize;
-    
+
     // Read response data
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    
+
     let response: ControlResponse = serde_json::from_slice(&buf)?;
-    
+
     Ok(response)
 }
-

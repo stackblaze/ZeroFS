@@ -213,7 +213,10 @@ impl NFSFileSystem for NFSAdapter {
             .readdir(&auth.into(), dirid, start_after, max_entries)
             .await
             .map_err(|e| {
-                error!("readdir error on dir {} start_after {}: {:?}", dirid, start_after, e);
+                error!(
+                    "readdir error on dir {} start_after {}: {:?}",
+                    dirid, start_after, e
+                );
                 e
             })?;
 

@@ -271,7 +271,12 @@ impl RpcClient {
     }
 
     // Snapshot operations
-    pub async fn create_snapshot_with_options(&self, source_name: &str, snapshot_name: &str, readonly: bool) -> Result<Dataset> {
+    pub async fn create_snapshot_with_options(
+        &self,
+        source_name: &str,
+        snapshot_name: &str,
+        readonly: bool,
+    ) -> Result<Dataset> {
         let request = proto::CreateSnapshotRequest {
             source_name: source_name.to_string(),
             snapshot_name: snapshot_name.to_string(),
@@ -331,7 +336,7 @@ impl RpcClient {
         file_path: &str,
     ) -> Result<Vec<u8>> {
         use futures::StreamExt;
-        
+
         let request = proto::ReadSnapshotFileRequest {
             snapshot_name: snapshot_name.to_string(),
             file_path: file_path.to_string(),
@@ -381,6 +386,7 @@ impl RpcClient {
 
     // Convenience method for creating read-write snapshots (default, like btrfs)
     pub async fn create_snapshot(&self, source_name: &str, snapshot_name: &str) -> Result<Dataset> {
-        self.create_snapshot_with_options(source_name, snapshot_name, false).await
+        self.create_snapshot_with_options(source_name, snapshot_name, false)
+            .await
     }
 }

@@ -103,7 +103,7 @@ impl DatasetRegistry {
         let root_subvol = Dataset::new(0, "root".to_string(), root_inode, created_at, false);
         let mut datasets = HashMap::new();
         let mut name_to_id = HashMap::new();
-        
+
         datasets.insert(0, root_subvol);
         name_to_id.insert("root".to_string(), 0);
 
@@ -125,13 +125,13 @@ impl DatasetRegistry {
         if self.name_to_id.contains_key(&dataset.name) {
             return Err(format!("Dataset '{}' already exists", dataset.name));
         }
-        
+
         let id = dataset.id;
         let name = dataset.name.clone();
-        
+
         self.datasets.insert(id, dataset);
         self.name_to_id.insert(name, id);
-        
+
         Ok(())
     }
 
@@ -140,7 +140,9 @@ impl DatasetRegistry {
     }
 
     pub fn get_by_name(&self, name: &str) -> Option<&Dataset> {
-        self.name_to_id.get(name).and_then(|id| self.datasets.get(id))
+        self.name_to_id
+            .get(name)
+            .and_then(|id| self.datasets.get(id))
     }
 
     pub fn remove_dataset(&mut self, id: DatasetId) -> Result<Dataset, String> {
@@ -149,11 +151,13 @@ impl DatasetRegistry {
             return Err("Cannot remove root dataset".to_string());
         }
 
-        let subvol = self.datasets.remove(&id)
+        let subvol = self
+            .datasets
+            .remove(&id)
             .ok_or_else(|| format!("Dataset {} not found", id))?;
-        
+
         self.name_to_id.remove(&subvol.name);
-        
+
         Ok(subvol)
     }
 
@@ -164,9 +168,7 @@ impl DatasetRegistry {
     }
 
     pub fn list_snapshots(&self) -> Vec<&Dataset> {
-        let mut snapshots: Vec<_> = self.datasets.values()
-            .filter(|s| s.is_snapshot)
-            .collect();
+        let mut snapshots: Vec<_> = self.datasets.values().filter(|s| s.is_snapshot).collect();
         snapshots.sort_by_key(|s| s.created_at);
         snapshots
     }
@@ -179,19 +181,19 @@ mod tests {
     #[test]
     fn test_dataset_registry() {
         let mut registry = DatasetRegistry::new_with_root(0, 1000);
-        
+
         assert_eq!(registry.datasets.len(), 1);
         assert_eq!(registry.default_dataset_id, 0);
-        
+
         // Add a new dataset
         let id = registry.allocate_id();
         let subvol = Dataset::new(id, "data".to_string(), 100, 2000, false);
         assert!(registry.add_dataset(subvol).is_ok());
-        
+
         // Verify we can retrieve it
         assert!(registry.get_by_name("data").is_some());
         assert!(registry.get_by_id(1).is_some());
-        
+
         // Test duplicate name
         let dup = Dataset::new(2, "data".to_string(), 200, 3000, false);
         assert!(registry.add_dataset(dup).is_err());
@@ -201,7 +203,7 @@ mod tests {
     fn test_snapshot_creation() {
         let source = Dataset::new(1, "source".to_string(), 100, 1000, false);
         let snapshot = Dataset::new_snapshot(2, "snap1".to_string(), &source, 200, 2000);
-        
+
         assert!(snapshot.is_snapshot);
         assert!(snapshot.is_readonly);
         assert_eq!(snapshot.parent_id, Some(1));
@@ -209,4 +211,3 @@ mod tests {
         assert_eq!(snapshot.generation, source.generation);
     }
 }
-
