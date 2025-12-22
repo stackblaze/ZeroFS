@@ -1,4 +1,5 @@
 use crate::bucket_identity;
+use crate::cache::FoyerCache;
 use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::encryption::SlateDbHandle;
@@ -15,10 +16,10 @@ use arc_swap::ArcSwap;
 use slatedb::admin::AdminBuilder;
 use slatedb::config::{
     CheckpointOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
-    ObjectStoreCacheOptions,
+    ObjectStoreCacheOptions, SizeTieredCompactionSchedulerOptions,
 };
-use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::object_store::path::Path;
+use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 use slatedb::{DbBuilder, DbReader};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -378,6 +379,7 @@ pub async fn build_slatedb(
     db_path: String,
     db_mode: DatabaseMode,
     lsm_config: Option<crate::config::LsmConfig>,
+    disable_compactor: bool,
 ) -> Result<(
     SlateDbHandle,
     Option<CheckpointRefreshParams>,
@@ -411,24 +413,30 @@ pub async fn build_slatedb(
         .map(|c| c.max_concurrent_compactions())
         .unwrap_or(crate::config::LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS);
 
+    let compactor_options = if disable_compactor {
+        None
+    } else {
+        Some(slatedb::config::CompactorOptions {
+            max_concurrent_compactions,
+            max_sst_size: 1024 * 1024 * 1024,
+            ..Default::default()
+        })
+    };
+
     let settings = slatedb::config::Settings {
         wal_enabled: false,
         l0_max_ssts,
-        l0_sst_size_bytes: 256 * 1024 * 1024,
-        filter_bits_per_key: 20,
+        l0_sst_size_bytes: 128 * 1024 * 1024,
+        filter_bits_per_key: 10,
         object_store_cache_options: ObjectStoreCacheOptions {
             root_folder: Some(cache_config.root_folder.clone()),
             max_cache_size_bytes: Some(slatedb_object_cache_bytes),
-            cache_puts: false,
+            cache_puts: true,
             ..Default::default()
         },
         flush_interval: Some(std::time::Duration::from_secs(30)),
         max_unflushed_bytes,
-        compactor_options: Some(slatedb::config::CompactorOptions {
-            max_concurrent_compactions,
-            max_sst_size: 256 * 1024 * 1024,
-            ..Default::default()
-        }),
+        compactor_options,
         compression_codec: None, // Disable compression - we handle it in encryption layer
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions {
@@ -447,11 +455,7 @@ pub async fn build_slatedb(
         ..Default::default()
     };
 
-    let cache = Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
-        max_capacity: slatedb_memory_cache_bytes,
-        time_to_live: None,
-        time_to_idle: None,
-    }));
+    let cache = Arc::new(FoyerCache::new(slatedb_memory_cache_bytes as usize));
 
     let db_path = Path::from(db_path);
 
@@ -470,16 +474,32 @@ pub async fn build_slatedb(
 
     match db_mode {
         DatabaseMode::ReadWrite => {
-            info!("Opening database in read-write mode");
-            let slatedb = Arc::new(
-                DbBuilder::new(db_path, object_store)
-                    .with_settings(settings)
-                    .with_gc_runtime(runtime_handle.clone())
+            if disable_compactor {
+                info!("Opening database in read-write mode (compactor disabled)");
+            } else {
+                info!("Opening database in read-write mode");
+            }
+
+            let mut builder = DbBuilder::new(db_path, object_store)
+                .with_settings(settings)
+                .with_gc_runtime(runtime_handle.clone())
+                .with_memory_cache(cache);
+
+            if !disable_compactor {
+                builder = builder
                     .with_compaction_runtime(runtime_handle.clone())
-                    .with_memory_cache(cache)
-                    .build()
-                    .await?,
-            );
+                    .with_compaction_scheduler_supplier(Arc::new(
+                        SizeTieredCompactionSchedulerSupplier::new(
+                            SizeTieredCompactionSchedulerOptions {
+                                max_compaction_sources: 32,
+                                include_size_threshold: 4.0,
+                                ..Default::default()
+                            },
+                        ),
+                    ));
+            }
+
+            let slatedb = Arc::new(builder.build().await?);
 
             Ok((
                 SlateDbHandle::ReadWrite(slatedb),
@@ -558,7 +578,11 @@ pub struct InitResult {
     )>,
 }
 
-async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Result<InitResult> {
+async fn initialize_filesystem(
+    settings: &Settings,
+    db_mode: DatabaseMode,
+    disable_compactor: bool,
+) -> Result<InitResult> {
     let url = settings.storage.url.clone();
 
     let cache_config = CacheConfig {
@@ -615,13 +639,20 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
         actual_db_path.clone(),
         db_mode,
         settings.lsm,
+        disable_compactor,
     )
     .await?;
 
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
     let db_handle = slatedb.clone();
-    let mut fs = ZeroFS::new_with_slatedb(slatedb, encryption_key, settings.max_bytes()).await?;
+    let mut fs = ZeroFS::new_with_slatedb(
+        slatedb,
+        encryption_key,
+        settings.max_bytes(),
+        settings.compression(),
+    )
+    .await?;
     
     // Initialize writeback cache if enabled
     let writeback_flusher = if !db_mode.is_read_only() && settings.writeback.as_ref().map(|w| w.enabled).unwrap_or(false) {
@@ -657,6 +688,7 @@ pub async fn run_server(
     config_path: PathBuf,
     read_only: bool,
     checkpoint_name: Option<String>,
+    no_compactor: bool,
 ) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -701,7 +733,7 @@ pub async fn run_server(
         }
     };
 
-    let init_result = initialize_filesystem(&settings, db_mode).await?;
+    let init_result = initialize_filesystem(&settings, db_mode, no_compactor).await?;
     let fs = init_result.fs;
     let checkpoint_params = init_result.checkpoint_params;
 

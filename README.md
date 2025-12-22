@@ -25,7 +25,7 @@ ZeroFS makes S3 storage feel like a real filesystem. It provides **file-level ac
 - **NFS Server** - Mount as a network filesystem on any OS
 - **9P Server** - High-performance alternative with better POSIX semantics
 - **NBD Server** - Access as raw block devices for ZFS, databases, or any filesystem
-- **Always Encrypted** - XChaCha20-Poly1305 encryption with compression
+- **Always Encrypted** - XChaCha20-Poly1305 encryption with LZ4 or Zstd compression
 - **High Performance** - Multi-layered caching with microsecond latencies
 - **S3 Compatible** - Works with any S3-compatible storage
 
@@ -170,7 +170,8 @@ url = "s3://my-bucket/zerofs-data"
 encryption_password = "${ZEROFS_PASSWORD}"
 
 [filesystem]
-max_size_gb = 100.0  # Optional: limit filesystem to 100 GB (defaults to 8 EiB)
+max_size_gb = 100.0  # Optional: limit filesystem to 100 GB (defaults to 16 EiB)
+compression = "lz4"  # Optional: "lz4" (default) or "zstd-{1-22}"
 
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]  # Can specify multiple addresses
@@ -294,7 +295,23 @@ ZeroFS supports configurable filesystem size limits:
 max_size_gb = 100.0  # Limit filesystem to 100 GB
 ```
 
-When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 8 EiB (effectively unlimited).
+When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 16 EiB (effectively unlimited).
+
+### Compression
+
+ZeroFS compresses file data before encryption. Choose between fast or high-ratio compression:
+
+```toml
+[filesystem]
+compression = "lz4"      # Fast compression (default)
+# or
+compression = "zstd-3"   # Zstd with level 1-22
+```
+
+- **`lz4`** (default): Very fast, moderate compression ratio
+- **`zstd-{level}`**: Configurable compression (1=fast, 22=maximum compression)
+
+You can change compression at any time without migration.
 
 ### Multiple Instances
 
@@ -345,9 +362,38 @@ addresses = ["127.0.0.1:7000"]
 unix_socket = "/tmp/zerofs.rpc.sock"
 ```
 
+### Standalone Compactor
+
+ZeroFS uses an LSM (Log-Structured Merge) tree as its storage engine. Compaction is a background process that merges sorted data files (SSTs) to reclaim space from deleted/updated data and improve read performance by reducing the number of files to search. This process is CPU and I/O intensive.
+
+By default, compaction runs within the main ZeroFS server. For demanding workloads, you can run a standalone compactor on a separate instance:
+
+**Start the writer without compaction:**
+
+```bash
+zerofs run -c zerofs.toml --no-compactor
+```
+
+**Start the standalone compactor** (on the same or different machine):
+
+```bash
+zerofs compactor -c zerofs.toml
+```
+
+Both instances access the same object storage backend.
+
+**When to use a standalone compactor:**
+
+- **Reduce egress costs**: Run a small compactor instance in the same region/zone as your S3 bucket. Compaction reads and writes large amounts of data - keeping it in the same zone avoids cross-region data transfer fees while your main server can run anywhere.
+- **Isolate resource usage**: Compaction competes with user requests for CPU and I/O. Separating it prevents latency spikes during heavy compaction.
+- **Cost optimization**: Run the compactor on cheaper spot/preemptible instances since it can be safely interrupted.
+
+The compactor uses the same configuration file and respects `[lsm].max_concurrent_compactions` for parallelism.
+
+
 ### Encryption
 
-Encryption is always enabled in ZeroFS. All file data is encrypted using XChaCha20-Poly1305 authenticated encryption with lz4 compression. Configure your password in the configuration file:
+Encryption is always enabled in ZeroFS. All file data is compressed (LZ4 or Zstd) and encrypted using XChaCha20-Poly1305 authenticated encryption. Configure your password in the configuration file:
 
 ```toml
 [storage]
@@ -797,11 +843,7 @@ ZeroFS has the following theoretical limits:
 - **Maximum file size**: 16 EiB (16 exbibytes = 18.4 exabytes) per file
 - **Maximum number of files over filesystem lifespan**: 2^64 (~18 quintillion)
 - **Maximum hardlinks per file**: ~4 billion (2^32)
-- **Maximum filesystem size**: 2^112 bytes
-  - = 4,096 geopbytes (where 1 geopbyte = 2^100 bytes)
-  - = 4.3 million yottabytes
-  - = 4.4 billion zettabytes
-  - = 4.5 trillion exabytes
+- **Maximum filesystem size**: 16 EiB (16 exbibytes = 18.4 exabytes)
 
 These limits come from the filesystem design:
 - Inode IDs and file sizes are stored as 64-bit integers

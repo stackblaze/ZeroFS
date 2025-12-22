@@ -6,31 +6,30 @@ pub mod key_codec;
 pub mod lock_manager;
 pub mod metrics;
 pub mod permissions;
-pub mod snapshot_manager;
-pub mod snapshot_vfs;
 pub mod stats;
 pub mod store;
-pub mod dataset;
 pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
-pub mod writeback_cache;
-
-use std::path::PathBuf;
 
 use self::flush_coordinator::FlushCoordinator;
 use self::key_codec::KeyCodec;
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
-use self::snapshot_vfs::SnapshotVfs;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
-use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore, DatasetStore};
+use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
-use self::writeback_cache::WritebackCache;
+use crate::config::CompressionConfig;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+#[cfg(feature = "failpoints")]
+use crate::failpoints as fp;
+#[cfg(feature = "failpoints")]
+use fp::fail_point;
 
 pub use self::gc::GarbageCollector;
 pub use self::write_coordinator::SequenceGuard;
@@ -70,7 +69,7 @@ pub fn get_current_time() -> (u64, u32) {
     (now.as_secs(), now.subsec_nanos())
 }
 
-pub const CHUNK_SIZE: usize = 32 * 1024; // 32KB chunks - matches existing data
+pub const CHUNK_SIZE: usize = 32 * 1024;
 pub const STATS_SHARDS: usize = 100;
 pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
 pub const NAME_MAX: usize = 255;
@@ -89,16 +88,12 @@ pub struct ZeroFS {
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
     pub tombstone_store: TombstoneStore,
-    pub dataset_store: DatasetStore,
-    pub snapshot_vfs: SnapshotVfs,
     pub lock_manager: Arc<LockManager>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub flush_coordinator: FlushCoordinator,
     pub write_coordinator: Arc<WriteCoordinator>,
-    pub writeback_cache: Option<Arc<WritebackCache>>,
     pub max_bytes: u64,
-    pub chunk_size: usize,
     pub tracer: AccessTracer,
 }
 
@@ -114,8 +109,9 @@ impl ZeroFS {
         slatedb: crate::encryption::SlateDbHandle,
         encryption_key: [u8; 32],
         max_bytes: u64,
+        compression: CompressionConfig,
     ) -> anyhow::Result<Self> {
-        let encryptor = Arc::new(EncryptionManager::new(&encryption_key));
+        let encryptor = Arc::new(EncryptionManager::new(&encryption_key, compression));
 
         let lock_manager = Arc::new(LockManager::new());
 
@@ -187,11 +183,6 @@ impl ZeroFS {
         let directory_store = DirectoryStore::new(db.clone());
         let inode_store = InodeStore::new(db.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone());
-        
-        // Get current time for dataset initialization
-        let (now_sec, _) = get_current_time();
-        let dataset_store = DatasetStore::new(db.clone(), 0, now_sec).await?;
-        let snapshot_vfs = SnapshotVfs::new(dataset_store.clone());
 
         let fs = Self {
             db: db.clone(),
@@ -199,16 +190,12 @@ impl ZeroFS {
             directory_store,
             inode_store,
             tombstone_store,
-            dataset_store,
-            snapshot_vfs,
             lock_manager,
             stats,
             global_stats,
             flush_coordinator,
             write_coordinator,
-            writeback_cache: None,
             max_bytes,
-            chunk_size: CHUNK_SIZE,
             tracer: AccessTracer::new(),
         };
 
@@ -220,35 +207,16 @@ impl ZeroFS {
         mut txn: EncryptedTransaction,
         seq_guard: &mut SequenceGuard,
     ) -> Result<(), FsError> {
-        self.commit_transaction_internal(txn, seq_guard, false).await
-    }
-
-    /// Commit transaction with optional immediate flush bypass for writeback cache
-    /// When bypass_cache=true, writes directly to SlateDB even if writeback cache is enabled
-    pub async fn commit_transaction_internal(
-        &self,
-        mut txn: EncryptedTransaction,
-        seq_guard: &mut SequenceGuard,
-        bypass_cache: bool,
-    ) -> Result<(), FsError> {
         self.inode_store.save_counter(&mut txn);
 
         let (encrypt_result, _) = tokio::join!(txn.into_inner(), seq_guard.wait_for_predecessors());
-        let (inner_batch, _cache_ops) = encrypt_result.map_err(|_| FsError::IoError)?;
+        let prepared = encrypt_result.map_err(|_| FsError::IoError)?;
 
-        // If writeback cache is enabled AND we're not bypassing it, write to cache
-        if !bypass_cache {
-            if let Some(wb_cache) = &self.writeback_cache {
-                wb_cache.write(inner_batch).await?;
-                seq_guard.mark_committed();
-                return Ok(());
-            }
-        }
-
-        // Default path or bypass: write directly to SlateDB
         self.db
             .write_raw_batch(
-                inner_batch,
+                prepared.batch,
+                prepared.pending_operations,
+                prepared.deleted_keys,
                 &WriteOptions {
                     await_durable: false,
                 },
@@ -273,7 +241,7 @@ impl ZeroFS {
         let mut current_id = id;
 
         while current_id != ROOT_INODE_ID {
-            if let Ok(inode) = self.get_inode(current_id).await {
+            if let Ok(inode) = self.inode_store.get(current_id).await {
                 let parent_id = match inode.parent() {
                     Some(p) => p,
                     None => {
@@ -298,25 +266,6 @@ impl ZeroFS {
 
         components.reverse();
         components
-    }
-
-    /// Get an inode - handles both real inodes and virtual snapshot directory inodes
-    pub async fn get_inode(&self, id: InodeId) -> Result<Inode, FsError> {
-        // Handle virtual .snapshots directory
-        if id == snapshot_vfs::SNAPSHOTS_DIR_INODE {
-            let (now_sec, _) = get_current_time();
-            return Ok(self.snapshot_vfs.get_snapshots_dir_inode(now_sec));
-        }
-
-        // Handle virtual snapshot directories
-        if SnapshotVfs::is_snapshot_dir(id) {
-            if let Some(snapshot_id) = SnapshotVfs::snapshot_id_from_inode(id) {
-                return self.snapshot_vfs.get_snapshot_dir_inode(snapshot_id).await;
-            }
-        }
-
-        // Regular inode from store
-        self.inode_store.get(id).await
     }
 
     /// Resolve inode ID to full path string
@@ -370,6 +319,7 @@ impl ZeroFS {
             crate::encryption::SlateDbHandle::ReadWrite(slatedb),
             encryption_key,
             u64::MAX,
+            CompressionConfig::default(),
         )
         .await
     }
@@ -393,6 +343,7 @@ impl ZeroFS {
             crate::encryption::SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
             encryption_key,
             u64::MAX,
+            CompressionConfig::default(),
         )
         .await
     }
@@ -519,6 +470,9 @@ impl ZeroFS {
 
                 self.chunk_store.write(&mut txn, id, offset, data).await?;
 
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::WRITE_AFTER_CHUNK);
+
                 file.size = new_size;
                 let (now_sec, now_nsec) = get_current_time();
                 file.mtime = now_sec;
@@ -531,7 +485,18 @@ impl ZeroFS {
                     file.mode &= !0o6000;
                 }
 
+                let parent_name_for_update = file.parent.zip(file.name.clone());
+
                 self.inode_store.save(&mut txn, id, &inode)?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::WRITE_AFTER_INODE);
+
+                if let Some((parent_id, name)) = parent_name_for_update {
+                    self.directory_store
+                        .update_inode_in_entry(&mut txn, parent_id, &name, id, &inode)
+                        .await?;
+                }
 
                 let stats_update = if let Some(update) = self
                     .global_stats
@@ -548,6 +513,9 @@ impl ZeroFS {
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard).await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::WRITE_AFTER_COMMIT);
 
                 if let Some(update) = stats_update {
                     self.global_stats.commit_update(&update);
@@ -650,10 +618,23 @@ impl ZeroFS {
                     .allocate_cookie(dirid, &mut txn)
                     .await?;
 
-                self.inode_store
-                    .save(&mut txn, file_id, &Inode::File(file_inode.clone()))?;
-                self.directory_store
-                    .add(&mut txn, dirid, name, file_id, cookie);
+                let file_inode_enum = Inode::File(file_inode.clone());
+                self.inode_store.save(&mut txn, file_id, &file_inode_enum)?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::CREATE_AFTER_INODE);
+
+                self.directory_store.add(
+                    &mut txn,
+                    dirid,
+                    name,
+                    file_id,
+                    cookie,
+                    Some(&file_inode_enum),
+                );
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::CREATE_AFTER_DIR_ENTRY);
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -661,19 +642,30 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
+                let parent_update_info = dir.name.clone().map(|n| (dir.parent, n));
+
                 self.inode_store.save(&mut txn, dirid, &dir_inode)?;
+
+                if let Some((parent_id, dir_name)) = parent_update_info {
+                    self.directory_store
+                        .update_inode_in_entry(&mut txn, parent_id, &dir_name, dirid, &dir_inode)
+                        .await
+                        .ok();
+                }
 
                 let stats_update = self.global_stats.prepare_inode_create(file_id).await;
                 self.global_stats
                     .add_to_transaction(&stats_update, &mut txn)?;
 
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
-                // Bypass writeback cache for create operations to ensure immediate visibility
-                self.commit_transaction_internal(txn, &mut seq_guard, true)
+                self.commit_transaction(txn, &mut seq_guard)
                     .await
                     .inspect_err(|e| {
                         error!("Failed to write batch: {:?}", e);
                     })?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::CREATE_AFTER_COMMIT);
 
                 self.global_stats.commit_update(&stats_update);
 
@@ -840,29 +832,6 @@ impl ZeroFS {
             String::from_utf8_lossy(filename)
         );
 
-        // Handle virtual .snapshots directory in root
-        if dirid == 0 && SnapshotVfs::is_snapshots_name(filename) {
-            debug!("lookup: found .snapshots virtual directory");
-            return Ok(snapshot_vfs::SNAPSHOTS_DIR_INODE);
-        }
-
-        // Handle lookups inside .snapshots directory
-        if dirid == snapshot_vfs::SNAPSHOTS_DIR_INODE {
-            debug!("lookup: inside .snapshots, looking for snapshot: {}", String::from_utf8_lossy(filename));
-            let snapshot_inode = self.snapshot_vfs.lookup_in_snapshots(filename).await?;
-            return Ok(snapshot_inode);
-        }
-
-        // Handle lookups inside snapshot directories - redirect to actual snapshot root
-        if SnapshotVfs::is_snapshot_dir(dirid) {
-            if let Some(snapshot_id) = SnapshotVfs::snapshot_id_from_inode(dirid) {
-                let actual_root = self.snapshot_vfs.get_snapshot_root_inode(snapshot_id).await?;
-                debug!("lookup: redirecting from virtual snapshot dir {} to actual root {}", dirid, actual_root);
-                // Perform lookup in the actual snapshot root using Box to avoid recursion issue
-                return Box::pin(self.lookup(creds, actual_root, filename)).await;
-            }
-        }
-
         let dir_inode = self.inode_store.get(dirid).await?;
 
         match dir_inode {
@@ -890,9 +859,8 @@ impl ZeroFS {
                     }
                     Err(FsError::NotFound) => {
                         debug!(
-                            "lookup not found: {} in directory {}",
-                            String::from_utf8_lossy(filename),
-                            dirid
+                            "lookup not found: {} in directory",
+                            String::from_utf8_lossy(filename)
                         );
                         Err(FsError::NotFound)
                     }
@@ -901,90 +869,6 @@ impl ZeroFS {
             }
             _ => Err(FsError::NotDirectory),
         }
-    }
-
-    /// Read directory entries for the virtual .snapshots directory
-    async fn readdir_snapshots(
-        &self,
-        auth: &AuthContext,
-        start_after: InodeId,
-        max_entries: usize,
-    ) -> Result<ReadDirResult, FsError> {
-        let creds = Credentials::from_auth_context(auth);
-        let snapshots_dir_inode = self.get_inode(snapshot_vfs::SNAPSHOTS_DIR_INODE).await?;
-        check_access(&snapshots_dir_inode, &creds, AccessMode::Read)?;
-
-        use crate::fs::store::directory::{COOKIE_DOT, COOKIE_DOTDOT};
-        use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
-
-        let mut entries = Vec::new();
-
-        // Handle . and ..
-        if start_after < COOKIE_DOT {
-            entries.push(DirEntry {
-                fileid: snapshot_vfs::SNAPSHOTS_DIR_INODE,
-                name: b".".to_vec(),
-                attr: InodeWithId {
-                    inode: &snapshots_dir_inode,
-                    id: snapshot_vfs::SNAPSHOTS_DIR_INODE,
-                }
-                .into(),
-                cookie: COOKIE_DOT,
-            });
-        }
-
-        if start_after < COOKIE_DOTDOT {
-            let root_inode = self.get_inode(0).await?;
-            entries.push(DirEntry {
-                fileid: 0,
-                name: b"..".to_vec(),
-                attr: InodeWithId {
-                    inode: &root_inode,
-                    id: 0,
-                }
-                .into(),
-                cookie: COOKIE_DOTDOT,
-            });
-        }
-
-        // List all snapshots
-        let snapshots = self.snapshot_vfs.list_snapshots().await;
-        let mut cookie = COOKIE_FIRST_ENTRY;
-
-        for snapshot in snapshots {
-            if cookie <= start_after {
-                cookie += 1;
-                continue;
-            }
-
-            if entries.len() >= max_entries {
-                break;
-            }
-
-            let snapshot_virtual_inode = SnapshotVfs::inode_for_snapshot(snapshot.id);
-            let snapshot_dir_inode = self.get_inode(snapshot_virtual_inode).await?;
-
-            entries.push(DirEntry {
-                fileid: snapshot_virtual_inode,
-                name: snapshot.name.as_bytes().to_vec(),
-                attr: InodeWithId {
-                    inode: &snapshot_dir_inode,
-                    id: snapshot_virtual_inode,
-                }
-                .into(),
-                cookie,
-            });
-
-            cookie += 1;
-        }
-
-        self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
-        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
-
-        Ok(ReadDirResult {
-            entries,
-            end: true, // Snapshots list is complete
-        })
     }
 
     pub async fn mkdir(
@@ -1002,24 +886,8 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        // Check if we're in the .snapshots directory itself (not allowed to create here)
-        if SnapshotVfs::is_snapshots_dir(dirid) {
-            return Err(FsError::ReadOnlyFilesystem);
-        }
-        
-        // For snapshot directories, check if the snapshot is readonly
-        if SnapshotVfs::is_snapshot_dir(dirid) {
-            if let Some(snapshot_id) = SnapshotVfs::snapshot_id_from_inode(dirid) {
-                if let Some(snapshot) = self.dataset_store.get_by_id(snapshot_id).await {
-                    if snapshot.is_readonly {
-                        return Err(FsError::ReadOnlyFilesystem);
-                    }
-                }
-            }
-        }
-
         let _guard = self.lock_manager.acquire_write(dirid).await;
-        let mut dir_inode = self.get_inode(dirid).await?;
+        let mut dir_inode = self.inode_store.get(dirid).await?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
@@ -1092,13 +960,24 @@ impl ZeroFS {
                     .allocate_cookie(dirid, &mut txn)
                     .await?;
 
-                self.inode_store.save(
+                let new_dir_inode_enum = Inode::Directory(new_dir_inode.clone());
+                self.inode_store
+                    .save(&mut txn, new_dir_id, &new_dir_inode_enum)?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKDIR_AFTER_INODE);
+
+                self.directory_store.add(
                     &mut txn,
+                    dirid,
+                    name,
                     new_dir_id,
-                    &Inode::Directory(new_dir_inode.clone()),
-                )?;
-                self.directory_store
-                    .add(&mut txn, dirid, name, new_dir_id, cookie);
+                    cookie,
+                    Some(&new_dir_inode_enum),
+                );
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKDIR_AFTER_DIR_ENTRY);
 
                 dir.entry_count += 1;
                 if dir.nlink == u32::MAX {
@@ -1110,15 +989,26 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
+                let parent_update_info = dir.name.clone().map(|n| (dir.parent, n));
+
                 self.inode_store.save(&mut txn, dirid, &dir_inode)?;
+
+                if let Some((parent_id, dir_name)) = parent_update_info {
+                    self.directory_store
+                        .update_inode_in_entry(&mut txn, parent_id, &dir_name, dirid, &dir_inode)
+                        .await
+                        .ok();
+                }
 
                 let stats_update = self.global_stats.prepare_inode_create(new_dir_id).await;
                 self.global_stats
                     .add_to_transaction(&stats_update, &mut txn)?;
 
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
-                // Bypass writeback cache for mkdir to ensure immediate visibility
-                self.commit_transaction_internal(txn, &mut seq_guard, true).await?;
+                self.commit_transaction(txn, &mut seq_guard).await?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKDIR_AFTER_COMMIT);
 
                 self.global_stats.commit_update(&stats_update);
 
@@ -1155,23 +1045,7 @@ impl ZeroFS {
         start_after: InodeId,
         max_entries: usize,
     ) -> Result<ReadDirResult, FsError> {
-        debug!("readdir called: dirid={}, start_after={}, max_entries={}", dirid, start_after, max_entries);
-        
-        // Handle virtual .snapshots directory readdir
-        if dirid == snapshot_vfs::SNAPSHOTS_DIR_INODE {
-            return self.readdir_snapshots(auth, start_after, max_entries).await;
-        }
-
-        // Handle virtual snapshot directory readdir - redirect to actual snapshot root
-        if SnapshotVfs::is_snapshot_dir(dirid) {
-            if let Some(snapshot_id) = SnapshotVfs::snapshot_id_from_inode(dirid) {
-                let actual_root = self.snapshot_vfs.get_snapshot_root_inode(snapshot_id).await?;
-                debug!("readdir: redirecting from virtual snapshot dir {} to actual root {}", dirid, actual_root);
-                return Box::pin(self.readdir(auth, actual_root, start_after, max_entries)).await;
-            }
-        }
-
-        let dir_inode = self.get_inode(dirid).await?;
+        let dir_inode = self.inode_store.get(dirid).await?;
 
         let creds = Credentials::from_auth_context(auth);
         check_access(&dir_inode, &creds, AccessMode::Read)?;
@@ -1198,12 +1072,20 @@ impl ZeroFS {
 
                 if start_after < COOKIE_DOTDOT {
                     let parent_id = if dirid == 0 { 0 } else { dir.parent };
-                    let parent_inode = self.get_inode(parent_id).await?;
-                    let parent_attr = InodeWithId {
+                    let parent_attr = if parent_id == dirid {
+                        InodeWithId {
+                            inode: &dir_inode,
+                            id: dirid,
+                        }
+                        .into()
+                    } else {
+                        let parent_inode = self.inode_store.get(parent_id).await?;
+                        InodeWithId {
                             inode: &parent_inode,
                             id: parent_id,
                         }
-                    .into();
+                        .into()
+                    };
                     entries.push(DirEntry {
                         fileid: parent_id,
                         name: b"..".to_vec(),
@@ -1212,45 +1094,15 @@ impl ZeroFS {
                     });
                 }
 
-                // Add .snapshots entry in root directory
-                // Cookie ordering: . (1), .. (2), .snapshots (use a high cookie value to avoid conflicts)
-                use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
-                // Use a cookie value that's much higher than regular entries to avoid conflicts
-                // Regular entries start at COOKIE_FIRST_ENTRY (3), so we'll use a value after all possible regular cookies
-                const SNAPSHOTS_COOKIE: u64 = 0xFFFFFFFF00000000; // High cookie value for .snapshots
-                
-                // Add .snapshots if we're in root and haven't passed it yet
-                // Include it after .. (cookie 2) but before we start listing regular entries
-                if dirid == 0 && start_after < SNAPSHOTS_COOKIE {
-                    debug!("Adding .snapshots entry to readdir results for root directory");
-                    let snapshots_inode = self.get_inode(snapshot_vfs::SNAPSHOTS_DIR_INODE).await?;
-                    entries.push(DirEntry {
-                        fileid: snapshot_vfs::SNAPSHOTS_DIR_INODE,
-                        name: b".snapshots".to_vec(),
-                        attr: InodeWithId {
-                            inode: &snapshots_inode,
-                            id: snapshot_vfs::SNAPSHOTS_DIR_INODE,
-                        }
-                        .into(),
-                        cookie: SNAPSHOTS_COOKIE,
-                    });
-                }
-
                 // Get regular entries, starting after the given cookie
                 let iter = if start_after < COOKIE_DOTDOT {
                     self.directory_store.list(dirid).await?
-                } else if dirid == 0 && start_after < SNAPSHOTS_COOKIE {
-                    // If we're before .snapshots cookie, list regular entries normally
-                    self.directory_store.list_from(dirid, COOKIE_FIRST_ENTRY).await?
-                } else if dirid == 0 && start_after >= SNAPSHOTS_COOKIE {
-                    // If we've passed .snapshots, continue with regular entries
-                    self.directory_store.list_from(dirid, COOKIE_FIRST_ENTRY).await?
                 } else {
                     self.directory_store.list_from(dirid, start_after).await?
                 };
                 pin_mut!(iter);
 
-                let mut dir_entries = Vec::new();
+                let mut dir_entries: Vec<(InodeId, Vec<u8>, u64, Option<Inode>)> = Vec::new();
                 let mut has_more = false;
 
                 while let Some(result) = iter.next().await {
@@ -1264,52 +1116,65 @@ impl ZeroFS {
                         debug!("readdir: filtering out /snapshots entry (use .snapshots instead)");
                         continue;
                     }
-                    dir_entries.push((entry.inode_id, entry.name, entry.cookie));
+                    dir_entries.push((entry.inode_id, entry.name, entry.cookie, entry.inode));
                 }
 
-                const BUFFER_SIZE: usize = 256;
-
-                let inode_futures = stream::iter(dir_entries.into_iter()).map(
-                    |(inode_id, name, cookie)| async move {
-                        match self.get_inode(inode_id).await {
-                            Ok(inode) => Ok::<_, FsError>(Some((inode_id, name, inode, cookie))),
-                            Err(FsError::NotFound) => {
-                                // Inode was deleted between directory listing and fetch - skip it
-                                debug!("readdir: skipping deleted entry (inode {})", inode_id);
-                                Ok(None)
-                            }
-                            Err(e) => {
-                                // Skip entries that fail to load (e.g., corrupted or inaccessible inodes)
-                                // This prevents a single bad entry from breaking the entire directory listing
-                                error!("readdir: failed to load inode {} (name: {:?}): {:?}, skipping", 
-                                    inode_id, String::from_utf8_lossy(&name), e);
-                                Ok(None)
-                            }
-                        }
-                    },
-                );
-
-                let loaded_entries: Vec<_> = inode_futures
-                    .buffered(BUFFER_SIZE)
-                    .collect::<Vec<_>>()
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
+                let lookup_indices: Vec<usize> = dir_entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, _, _, inode))| inode.is_none())
+                    .map(|(i, _)| i)
                     .collect();
 
-                for (inode_id, name, inode, cookie) in loaded_entries {
-                    entries.push(DirEntry {
-                        fileid: inode_id,
-                        name,
-                        attr: InodeWithId {
-                            inode: &inode,
-                            id: inode_id,
-                        }
-                        .into(),
-                        cookie,
-                    });
+                if !lookup_indices.is_empty() {
+                    const BUFFER_SIZE: usize = 256;
+
+                    let lookup_entries: Vec<_> = lookup_indices
+                        .iter()
+                        .map(|&i| (i, dir_entries[i].0))
+                        .collect();
+
+                    let inode_futures = stream::iter(lookup_entries.into_iter()).map(
+                        |(idx, inode_id)| async move {
+                            match self.inode_store.get(inode_id).await {
+                                Ok(inode) => Ok::<_, FsError>((idx, Some(inode))),
+                                Err(FsError::NotFound) => {
+                                    debug!("readdir: skipping deleted entry (inode {})", inode_id);
+                                    Ok((idx, None))
+                                }
+                                Err(e) => {
+                                    error!("readdir: failed to load inode {}: {:?}", inode_id, e);
+                                    Err(e)
+                                }
+                            }
+                        },
+                    );
+
+                    let loaded_inodes: Vec<_> = inode_futures
+                        .buffered(BUFFER_SIZE)
+                        .collect::<Vec<_>>()
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    for (idx, inode_opt) in loaded_inodes {
+                        dir_entries[idx].3 = inode_opt;
+                    }
+                }
+
+                for (inode_id, name, cookie, inode_opt) in dir_entries {
+                    if let Some(inode) = inode_opt {
+                        entries.push(DirEntry {
+                            fileid: inode_id,
+                            name,
+                            attr: InodeWithId {
+                                inode: &inode,
+                                id: inode_id,
+                            }
+                            .into(),
+                            cookie,
+                        });
+                    }
                 }
 
                 self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
@@ -1406,8 +1271,21 @@ impl ZeroFS {
             .await?;
 
         self.inode_store.save(&mut txn, new_id, &symlink_inode)?;
-        self.directory_store
-            .add(&mut txn, dirid, linkname, new_id, cookie);
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::SYMLINK_AFTER_INODE);
+
+        self.directory_store.add(
+            &mut txn,
+            dirid,
+            linkname,
+            new_id,
+            cookie,
+            Some(&symlink_inode),
+        );
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::SYMLINK_AFTER_DIR_ENTRY);
 
         dir.entry_count += 1;
         dir.mtime = now_sec;
@@ -1415,7 +1293,16 @@ impl ZeroFS {
         dir.ctime = now_sec;
         dir.ctime_nsec = now_nsec;
 
+        let parent_update_info = dir.name.clone().map(|n| (dir.parent, n));
+
         self.inode_store.save(&mut txn, dirid, &dir_inode)?;
+
+        if let Some((parent_id, dir_name)) = parent_update_info {
+            self.directory_store
+                .update_inode_in_entry(&mut txn, parent_id, &dir_name, dirid, &dir_inode)
+                .await
+                .ok();
+        }
 
         let stats_update = self.global_stats.prepare_inode_create(new_id).await;
         self.global_stats
@@ -1423,6 +1310,9 @@ impl ZeroFS {
 
         let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::SYMLINK_AFTER_COMMIT);
 
         self.global_stats.commit_update(&stats_update);
 
@@ -1496,13 +1386,27 @@ impl ZeroFS {
             return Err(FsError::Exists);
         }
 
+        let original_parent_name = file_inode
+            .parent()
+            .zip(file_inode.name().map(|n| n.to_vec()));
+
         let mut txn = self.db.new_transaction()?;
         let cookie = self
             .directory_store
             .allocate_cookie(linkdirid, &mut txn)
             .await?;
+
         self.directory_store
-            .add(&mut txn, linkdirid, linkname, fileid, cookie);
+            .add(&mut txn, linkdirid, linkname, fileid, cookie, None);
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::LINK_AFTER_DIR_ENTRY);
+
+        if let Some((orig_parent, orig_name)) = original_parent_name {
+            self.directory_store
+                .convert_to_reference(&mut txn, orig_parent, &orig_name, fileid)
+                .await?;
+        }
 
         let (now_sec, now_nsec) = get_current_time();
         match &mut file_inode {
@@ -1511,7 +1415,6 @@ impl ZeroFS {
                     return Err(FsError::TooManyLinks);
                 }
                 file.nlink += 1;
-                // When transitioning from 1 to 2+ links, clear parent/name for hardlinked files
                 if file.nlink > 1 {
                     file.parent = None;
                     file.name = None;
@@ -1527,7 +1430,6 @@ impl ZeroFS {
                     return Err(FsError::TooManyLinks);
                 }
                 special.nlink += 1;
-                // When transitioning from 1 to 2+ links, clear parent/name for hardlinked files
                 if special.nlink > 1 {
                     special.parent = None;
                     special.name = None;
@@ -1540,17 +1442,37 @@ impl ZeroFS {
 
         self.inode_store.save(&mut txn, fileid, &file_inode)?;
 
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::LINK_AFTER_INODE);
+
         link_dir.entry_count += 1;
         link_dir.mtime = now_sec;
         link_dir.mtime_nsec = now_nsec;
         link_dir.ctime = now_sec;
         link_dir.ctime_nsec = now_nsec;
 
+        let link_dir_inode_updated = Inode::Directory(link_dir.clone());
         self.inode_store
-            .save(&mut txn, linkdirid, &Inode::Directory(link_dir))?;
+            .save(&mut txn, linkdirid, &link_dir_inode_updated)?;
+
+        if let Some(dir_name) = &link_dir.name {
+            self.directory_store
+                .update_inode_in_entry(
+                    &mut txn,
+                    link_dir.parent,
+                    dir_name,
+                    linkdirid,
+                    &link_dir_inode_updated,
+                )
+                .await
+                .ok();
+        }
 
         let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::LINK_AFTER_COMMIT);
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -1663,7 +1585,21 @@ impl ZeroFS {
                             .truncate(&mut txn, id, old_size, new_size)
                             .await?;
 
+                        #[cfg(feature = "failpoints")]
+                        fail_point!(fp::TRUNCATE_AFTER_CHUNKS);
+
+                        let parent_name_for_update = file.parent.zip(file.name.clone());
+
                         self.inode_store.save(&mut txn, id, &inode)?;
+
+                        #[cfg(feature = "failpoints")]
+                        fail_point!(fp::TRUNCATE_AFTER_INODE);
+
+                        if let Some((parent_id, name)) = parent_name_for_update {
+                            self.directory_store
+                                .update_inode_in_entry(&mut txn, parent_id, &name, id, &inode)
+                                .await?;
+                        }
 
                         let stats_update = if let Some(update) = self
                             .global_stats
@@ -1678,6 +1614,9 @@ impl ZeroFS {
 
                         let mut seq_guard = self.write_coordinator.allocate_sequence();
                         self.commit_transaction(txn, &mut seq_guard).await?;
+
+                        #[cfg(feature = "failpoints")]
+                        fail_point!(fp::TRUNCATE_AFTER_COMMIT);
 
                         if let Some(update) = stats_update {
                             self.global_stats.commit_update(&update);
@@ -1962,6 +1901,15 @@ impl ZeroFS {
 
         let mut txn = self.db.new_transaction()?;
         self.inode_store.save(&mut txn, id, &inode)?;
+
+        if let Some(parent_id) = inode.parent()
+            && let Some(name) = inode.name()
+        {
+            self.directory_store
+                .update_inode_in_entry(&mut txn, parent_id, name, id, &inode)
+                .await?;
+        }
+
         let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
 
@@ -2064,8 +2012,15 @@ impl ZeroFS {
                     .await?;
 
                 self.inode_store.save(&mut txn, special_id, &inode)?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKNOD_AFTER_INODE);
+
                 self.directory_store
-                    .add(&mut txn, dirid, name, special_id, cookie);
+                    .add(&mut txn, dirid, name, special_id, cookie, Some(&inode));
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKNOD_AFTER_DIR_ENTRY);
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -2073,7 +2028,16 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
+                let parent_update_info = dir.name.clone().map(|n| (dir.parent, n));
+
                 self.inode_store.save(&mut txn, dirid, &dir_inode)?;
+
+                if let Some((parent_id, dir_name)) = parent_update_info {
+                    self.directory_store
+                        .update_inode_in_entry(&mut txn, parent_id, &dir_name, dirid, &dir_inode)
+                        .await
+                        .ok();
+                }
 
                 let stats_update = self.global_stats.prepare_inode_create(special_id).await;
                 self.global_stats
@@ -2081,6 +2045,9 @@ impl ZeroFS {
 
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard).await?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKNOD_AFTER_COMMIT);
 
                 self.global_stats.commit_update(&stats_update);
 
@@ -2182,12 +2149,19 @@ impl ZeroFS {
                                     .delete_range(&mut txn, file_id, 0, total_chunks);
                             } else {
                                 self.tombstone_store.add(&mut txn, file_id, file.size);
+
+                                #[cfg(feature = "failpoints")]
+                                fail_point!(fp::REMOVE_AFTER_TOMBSTONE);
+
                                 self.stats
                                     .tombstones_created
                                     .fetch_add(1, Ordering::Relaxed);
                             }
 
                             self.inode_store.delete(&mut txn, file_id);
+
+                            #[cfg(feature = "failpoints")]
+                            fail_point!(fp::REMOVE_AFTER_INODE_DELETE);
                             self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -2196,7 +2170,15 @@ impl ZeroFS {
                             return Err(FsError::NotEmpty);
                         }
                         self.inode_store.delete(&mut txn, file_id);
+
+                        #[cfg(feature = "failpoints")]
+                        fail_point!(fp::RMDIR_AFTER_INODE_DELETE);
+
                         self.directory_store.delete_directory(&mut txn, file_id);
+
+                        #[cfg(feature = "failpoints")]
+                        fail_point!(fp::RMDIR_AFTER_DIR_CLEANUP);
+
                         dir.nlink = dir.nlink.saturating_sub(1);
                         self.stats
                             .directories_deleted
@@ -2225,13 +2207,25 @@ impl ZeroFS {
                 self.directory_store
                     .unlink_entry(&mut txn, dirid, name, cookie);
 
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::REMOVE_AFTER_DIR_UNLINK);
+
                 dir.entry_count = dir.entry_count.saturating_sub(1);
                 dir.mtime = now_sec;
                 dir.mtime_nsec = now_nsec;
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
+                let parent_update_info = dir.name.clone().map(|n| (dir.parent, n));
+
                 self.inode_store.save(&mut txn, dirid, &dir_inode)?;
+
+                if let Some((parent_id, dir_name)) = parent_update_info {
+                    self.directory_store
+                        .update_inode_in_entry(&mut txn, parent_id, &dir_name, dirid, &dir_inode)
+                        .await
+                        .ok();
+                }
 
                 // For directories and symlinks: always remove from stats
                 // For files and special files: only remove if this is the last link
@@ -2257,6 +2251,9 @@ impl ZeroFS {
 
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard).await?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::REMOVE_AFTER_COMMIT);
 
                 if let Some(update) = stats_update {
                     self.global_stats.commit_update(&update);
@@ -2522,6 +2519,9 @@ impl ZeroFS {
                 }
             }
 
+            #[cfg(feature = "failpoints")]
+            fail_point!(fp::RENAME_AFTER_TARGET_DELETE);
+
             // For directories and symlinks: always remove from stats
             // For files and special files: only remove if this is the last link
             if should_always_remove_stats || original_nlink <= 1 {
@@ -2535,8 +2535,6 @@ impl ZeroFS {
             self.directory_store
                 .unlink_entry(&mut txn, to_dirid, to_name, target_cookie.unwrap());
         } else if same_inode {
-            // When source and target are the same inode, we still need to unlink the target entry
-            // but we skip the inode processing above since we handle nlink when saving source_inode
             self.directory_store
                 .unlink_entry(&mut txn, to_dirid, to_name, target_cookie.unwrap());
         }
@@ -2544,22 +2542,9 @@ impl ZeroFS {
         self.directory_store
             .unlink_entry(&mut txn, from_dirid, from_name, source_cookie);
 
-        // Reuse cookie when renaming within the same directory to avoid
-        // duplicate entries during readdir iteration
-        let new_cookie = if from_dirid == to_dirid {
-            source_cookie
-        } else {
-            self.directory_store
-                .allocate_cookie(to_dirid, &mut txn)
-                .await?
-        };
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::RENAME_AFTER_SOURCE_UNLINK);
 
-        self.directory_store
-            .add(&mut txn, to_dirid, to_name, source_inode_id, new_cookie);
-
-        // Update source inode's name (and parent if directory changed)
-        // For hardlinked files (nlink > 1), parent/name are already None
-        // When same_inode is true, we need to decrement nlink since we're removing the target entry
         let dir_changed = from_dirid != to_dirid;
         let (now_sec, now_nsec) = get_current_time();
         match &mut source_inode {
@@ -2570,8 +2555,6 @@ impl ZeroFS {
                 d.name = Some(to_name.to_vec());
             }
             Inode::File(f) => {
-                // When renaming one hardlink over another to the same inode,
-                // decrement nlink since we're removing the target entry
                 if same_inode {
                     f.nlink = f.nlink.saturating_sub(1);
                     f.ctime = now_sec;
@@ -2602,12 +2585,37 @@ impl ZeroFS {
                 }
             }
         }
+
+        let new_cookie = if from_dirid == to_dirid {
+            source_cookie
+        } else {
+            self.directory_store
+                .allocate_cookie(to_dirid, &mut txn)
+                .await?
+        };
+
+        let embed_inode = if source_inode.nlink() == 1 {
+            Some(&source_inode)
+        } else {
+            None
+        };
+        self.directory_store.add(
+            &mut txn,
+            to_dirid,
+            to_name,
+            source_inode_id,
+            new_cookie,
+            embed_inode,
+        );
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::RENAME_AFTER_NEW_ENTRY);
+
         self.inode_store
             .save(&mut txn, source_inode_id, &source_inode)?;
 
         let is_moved_dir = matches!(source_inode, Inode::Directory(_));
 
-        // Update directory metadata using already-fetched inodes
         if let Inode::Directory(d) = &mut from_dir {
             if from_dirid != to_dirid {
                 // Moving to different directory: source leaves from_dir
@@ -2627,6 +2635,21 @@ impl ZeroFS {
         }
         self.inode_store.save(&mut txn, from_dirid, &from_dir)?;
 
+        if let Inode::Directory(from_dir_data) = &from_dir
+            && let Some(dir_name) = &from_dir_data.name
+        {
+            self.directory_store
+                .update_inode_in_entry(
+                    &mut txn,
+                    from_dir_data.parent,
+                    dir_name,
+                    from_dirid,
+                    &from_dir,
+                )
+                .await
+                .ok();
+        }
+
         if let Some(ref mut to_dir) = to_dir {
             if let Inode::Directory(d) = to_dir {
                 if target_inode_id.is_none() {
@@ -2643,7 +2666,20 @@ impl ZeroFS {
                 d.ctime = now_sec;
                 d.ctime_nsec = now_nsec;
             }
+            let to_dir_update_info = if let Inode::Directory(d) = &to_dir {
+                d.name.clone().map(|n| (d.parent, n))
+            } else {
+                None
+            };
+
             self.inode_store.save(&mut txn, to_dirid, to_dir)?;
+
+            if let Some((parent_id, dir_name)) = to_dir_update_info {
+                self.directory_store
+                    .update_inode_in_entry(&mut txn, parent_id, &dir_name, to_dirid, to_dir)
+                    .await
+                    .ok();
+            }
         }
 
         if let Some(ref update) = target_stats_update {
@@ -2652,6 +2688,9 @@ impl ZeroFS {
 
         let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::RENAME_AFTER_COMMIT);
 
         if let Some(update) = target_stats_update {
             self.global_stats.commit_update(&update);
@@ -2853,6 +2892,7 @@ mod tests {
             crate::encryption::SlateDbHandle::ReadWrite(slatedb),
             test_key,
             u64::MAX,
+            CompressionConfig::default(),
         )
         .await
         .unwrap();
@@ -3948,5 +3988,280 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dir_scan_entry_embeds_inode_on_create() {
+        use futures::StreamExt;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+
+        assert_eq!(entry.name, b"test.txt");
+        assert_eq!(entry.inode_id, file_id);
+        assert!(
+            entry.inode.is_some(),
+            "Newly created file should have embedded inode"
+        );
+
+        let embedded = entry.inode.unwrap();
+        match embedded {
+            Inode::File(f) => {
+                assert_eq!(f.nlink, 1);
+                assert!(f.parent.is_some());
+                assert!(f.name.is_some());
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dir_scan_entry_updates_on_write() {
+        use futures::StreamExt;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(b"hello world".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+
+        let embedded = entry.inode.expect("Should have embedded inode");
+        match embedded {
+            Inode::File(f) => {
+                assert_eq!(f.size, 11, "Embedded inode should have updated size");
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dir_scan_entry_updates_on_setattr() {
+        use futures::StreamExt;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let attrs = SetAttributes {
+            mode: SetMode::Set(0o755),
+            ..Default::default()
+        };
+        fs.setattr(&test_creds(), file_id, &attrs).await.unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+
+        let embedded = entry.inode.expect("Should have embedded inode");
+        match embedded {
+            Inode::File(f) => {
+                assert_eq!(
+                    f.mode & 0o777,
+                    0o755,
+                    "Embedded inode should have updated mode"
+                );
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dir_scan_entry_becomes_reference_on_hardlink() {
+        use futures::StreamExt;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+        assert!(
+            entry.inode.is_some(),
+            "Before hardlink, should have embedded inode"
+        );
+        drop(entries);
+
+        fs.link(&(&test_auth()).into(), file_id, 0, b"hardlink.txt")
+            .await
+            .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+
+        let entry1 = entries.next().await.unwrap().unwrap();
+        let entry2 = entries.next().await.unwrap().unwrap();
+
+        let (original, hardlink) = if entry1.name == b"original.txt" {
+            (entry1, entry2)
+        } else {
+            (entry2, entry1)
+        };
+
+        assert!(
+            original.inode.is_none(),
+            "Original entry should be Reference after hardlink"
+        );
+        assert!(
+            hardlink.inode.is_none(),
+            "Hardlink entry should be Reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dir_scan_entry_restored_on_rename_over_same_inode() {
+        use futures::StreamExt;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.link(&(&test_auth()).into(), file_id, 0, b"hardlink.txt")
+            .await
+            .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.unwrap();
+            assert!(
+                entry.inode.is_none(),
+                "Both entries should be Reference with nlink=2"
+            );
+        }
+        drop(entries);
+
+        fs.rename(
+            &(&test_auth()).into(),
+            0,
+            b"hardlink.txt",
+            0,
+            b"original.txt",
+        )
+        .await
+        .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+
+        assert_eq!(entry.name, b"original.txt");
+        assert!(
+            entry.inode.is_some(),
+            "After rename-over-same-inode (nlink=1), should have embedded inode"
+        );
+
+        // Verify nlink is 1
+        let embedded = entry.inode.unwrap();
+        match embedded {
+            Inode::File(f) => {
+                assert_eq!(f.nlink, 1);
+                assert!(f.parent.is_some(), "parent should be restored");
+                assert!(f.name.is_some(), "name should be restored");
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_readdir_uses_embedded_inode() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(b"test content".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        let result = fs.readdir(&(&test_auth()).into(), 0, 0, 10).await.unwrap();
+
+        let file_entry = result
+            .entries
+            .iter()
+            .find(|e| e.name == b"test.txt")
+            .expect("Should find test.txt");
+
+        assert_eq!(file_entry.fileid, file_id);
+        assert_eq!(
+            file_entry.attr.size, 12,
+            "Should have correct size from embedded inode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_readdir_fetches_inode_for_hardlinks() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(b"test content".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        fs.link(&(&test_auth()).into(), file_id, 0, b"hardlink.txt")
+            .await
+            .unwrap();
+
+        let result = fs.readdir(&(&test_auth()).into(), 0, 0, 10).await.unwrap();
+
+        let original = result
+            .entries
+            .iter()
+            .find(|e| e.name == b"original.txt")
+            .expect("Should find original.txt");
+
+        let hardlink = result
+            .entries
+            .iter()
+            .find(|e| e.name == b"hardlink.txt")
+            .expect("Should find hardlink.txt");
+
+        // Both should have the same inode id and attributes
+        assert_eq!(original.fileid, file_id);
+        assert_eq!(hardlink.fileid, file_id);
+        assert_eq!(original.attr.size, 12);
+        assert_eq!(hardlink.attr.size, 12);
+        assert_eq!(original.attr.nlink, 2);
+        assert_eq!(hardlink.attr.nlink, 2);
     }
 }

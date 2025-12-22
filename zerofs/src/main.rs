@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::io::BufRead;
 
 mod bucket_identity;
+mod cache;
 mod checkpoint_manager;
 mod cli;
 mod config;
@@ -23,6 +24,9 @@ mod test_helpers;
 
 #[cfg(test)]
 mod posix_tests;
+
+#[cfg(feature = "failpoints")]
+mod failpoints;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -78,8 +82,9 @@ async fn main() -> Result<()> {
             config,
             read_only,
             checkpoint,
+            no_compactor,
         } => {
-            cli::server::run_server(config, read_only, checkpoint).await?;
+            cli::server::run_server(config, read_only, checkpoint, no_compactor).await?;
         }
         cli::Commands::Debug { subcommand } => match subcommand {
             cli::DebugCommands::ListKeys { config } => {
@@ -169,6 +174,9 @@ async fn main() -> Result<()> {
         },
         cli::Commands::Fatrace { config } => {
             cli::fatrace::run_fatrace(config).await?;
+        }
+        cli::Commands::Compactor { config } => {
+            cli::compactor::run_compactor(config).await?;
         }
     }
 
