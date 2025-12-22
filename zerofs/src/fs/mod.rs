@@ -14,6 +14,7 @@ pub mod dataset;
 pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
+pub mod writeback_cache;
 
 use std::path::PathBuf;
 
@@ -26,6 +27,7 @@ use self::stats::{FileSystemGlobalStats, StatsShardData};
 use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore, DatasetStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
+use self::writeback_cache::WritebackCache;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
 use std::sync::Arc;
@@ -94,6 +96,7 @@ pub struct ZeroFS {
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub flush_coordinator: FlushCoordinator,
     pub write_coordinator: Arc<WriteCoordinator>,
+    pub writeback_cache: Option<Arc<WritebackCache>>,
     pub max_bytes: u64,
     pub tracer: AccessTracer,
 }
@@ -202,6 +205,7 @@ impl ZeroFS {
             global_stats,
             flush_coordinator,
             write_coordinator,
+            writeback_cache: None,
             max_bytes,
             tracer: AccessTracer::new(),
         };
@@ -219,6 +223,14 @@ impl ZeroFS {
         let (encrypt_result, _) = tokio::join!(txn.into_inner(), seq_guard.wait_for_predecessors());
         let (inner_batch, _cache_ops) = encrypt_result.map_err(|_| FsError::IoError)?;
 
+        // If writeback cache is enabled, write to cache instead of directly to SlateDB
+        if let Some(wb_cache) = &self.writeback_cache {
+            wb_cache.write(inner_batch).await?;
+            seq_guard.mark_committed();
+            return Ok(());
+        }
+
+        // Default path: write directly to SlateDB
         self.db
             .write_raw_batch(
                 inner_batch,
