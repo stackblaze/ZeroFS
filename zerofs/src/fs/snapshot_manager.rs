@@ -25,6 +25,7 @@ pub struct SnapshotManager {
     inode_store: InodeStore,
     dataset_store: DatasetStore,
     directory_store: DirectoryStore,
+    writeback_cache: Option<Arc<crate::fs::writeback_cache::WritebackCache>>,
 }
 
 impl SnapshotManager {
@@ -39,7 +40,13 @@ impl SnapshotManager {
             inode_store,
             dataset_store,
             directory_store,
+            writeback_cache: None,
         }
+    }
+
+    pub fn with_writeback_cache(mut self, cache: Arc<crate::fs::writeback_cache::WritebackCache>) -> Self {
+        self.writeback_cache = Some(cache);
+        self
     }
 
     /// Ensure /snapshots directory exists, create it if it doesn't
@@ -371,6 +378,14 @@ impl SnapshotManager {
     ) -> Result<Dataset, FsError> {
         if self.db.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem);
+        }
+
+        // CRITICAL: Flush writeback cache before snapshot to ensure all data is captured
+        // This ensures newly created/modified files are visible in the snapshot
+        if let Some(ref cache) = self.writeback_cache {
+            tracing::info!("Flushing writeback cache before snapshot creation...");
+            cache.flush_now(self.db.as_ref()).await?;
+            tracing::info!("Writeback cache flushed successfully");
         }
 
         // Get the source dataset

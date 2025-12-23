@@ -820,12 +820,19 @@ pub async fn run_server(
     ));
 
     // Create snapshot manager
-    let snapshot_manager = Arc::new(crate::fs::snapshot_manager::SnapshotManager::new(
+    let mut snapshot_manager = crate::fs::snapshot_manager::SnapshotManager::new(
         fs.db.clone(),
         fs.inode_store.clone(),
         (*fs.dataset_store).clone(),
         fs.directory_store.clone(),
-    ));
+    );
+
+    // Add writeback cache awareness to snapshot manager
+    if let Some(ref cache) = fs.writeback_cache {
+        snapshot_manager = snapshot_manager.with_writeback_cache(cache.clone());
+    }
+
+    let snapshot_manager = Arc::new(snapshot_manager);
 
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),

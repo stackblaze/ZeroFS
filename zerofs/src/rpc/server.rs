@@ -429,6 +429,19 @@ impl AdminService for AdminRpcServer {
         let source_path = req.source_path;
         let destination_path = req.destination_path;
 
+        // CRITICAL: Flush writeback cache before instant restore to ensure consistency
+        // This ensures:
+        // 1. Recently deleted files are actually deleted in backend
+        // 2. Recently created files are visible in snapshots
+        // 3. directory_store.exists() sees accurate state
+        tracing::info!("Flushing writeback cache before instant restore...");
+        if let Some(ref cache) = self.fs.writeback_cache {
+            cache.flush_now(self.fs.db.as_ref()).await.map_err(|e| {
+                Status::internal(format!("Failed to flush writeback cache: {}", e))
+            })?;
+            tracing::info!("Writeback cache flushed successfully");
+        }
+
         // Get snapshot info
         let snapshot = self
             .snapshot_manager
@@ -495,22 +508,34 @@ impl AdminService for AdminRpcServer {
         }
 
         // Now look up the filename in the parent directory
+        tracing::info!(
+            "Looking up filename '{}' in snapshot dir inode {}",
+            filename,
+            current_inode
+        );
+        
         current_inode = fs_ref
             .directory_store
             .get(current_inode, filename.as_bytes())
             .await
             .map_err(|e| {
+                tracing::error!(
+                    "Failed to find '{}' in snapshot dir {}: {:?}",
+                    filename,
+                    current_inode,
+                    e
+                );
                 Status::not_found(format!("File '{}' not found in directory: {}", filename, e))
             })?;
 
-        // current_inode is now the source file inode
+        // current_inode is now the source file inode (from snapshot)
         let source_file_inode = fs_ref
             .inode_store
             .get(current_inode)
             .await
             .map_err(|e| Status::internal(format!("Failed to read file inode: {}", e)))?;
 
-        let (file_size, file_nlink) = match source_file_inode {
+        let (file_size, file_nlink) = match &source_file_inode {
             Inode::File(file) => (file.size, file.nlink),
             _ => {
                 return Err(Status::invalid_argument(
@@ -518,6 +543,13 @@ impl AdminService for AdminRpcServer {
                 ));
             }
         };
+
+        tracing::info!(
+            "Source file inode {} size={} nlink={} - will copy to new inode in root dataset",
+            current_inode,
+            file_size,
+            file_nlink
+        );
 
         // Parse destination path to get directory and filename
         let dest_parts: Vec<&str> = destination_path
@@ -577,37 +609,101 @@ impl AdminService for AdminRpcServer {
             gids: vec![],
         };
 
-        // Create link (directory entry pointing to same inode) - INSTANT COW!
-        fs_ref
-            .link(&auth, current_inode, dest_dir_inode, filename.as_bytes())
-            .await
-            .map_err(|e| {
-                Status::internal(format!("Failed to create instant restore link: {}", e))
-            })?;
-
-        // Get updated nlink count
-        let updated_inode = fs_ref
-            .inode_store
-            .get(current_inode)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to read updated inode: {}", e)))?;
-
-        let updated_nlink = match updated_inode {
-            Inode::File(file) => file.nlink,
-            _ => file_nlink + 1,
-        };
-
+        // INSTANT RESTORE: Create a new inode in the root dataset that shares data with the snapshot inode
+        // This is COW - the data chunks are shared until modified
         tracing::info!(
-            "Instant restore complete: inode {}, size {}, nlink {}",
+            "Creating new inode in root dataset that shares data chunks with snapshot inode {}",
+            current_inode
+        );
+        
+        // Allocate a new inode ID in the root dataset
+        let new_inode_id = fs_ref.inode_store.allocate();
+        
+        // Clone the file inode but with new metadata for the root dataset
+        let mut new_file_inode = source_file_inode.clone();
+        if let Inode::File(ref mut file) = new_file_inode {
+            file.nlink = 1; // New inode starts with nlink=1
+            file.parent = Some(dest_dir_inode);
+            file.name = Some(filename.as_bytes().to_vec());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            file.ctime = now;
+            file.ctime_nsec = 0;
+        }
+        
+        // Create transaction to add the new inode
+        let mut txn = fs_ref.db.new_transaction().map_err(|e| {
+            Status::internal(format!("Failed to create transaction: {}", e))
+        })?;
+        
+        // Allocate directory cookie
+        let cookie = fs_ref
+            .directory_store
+            .allocate_cookie(dest_dir_inode, &mut txn)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to allocate cookie: {}", e)))?;
+        
+        // Add directory entry
+        fs_ref.directory_store.add(
+            &mut txn,
+            dest_dir_inode,
+            filename.as_bytes(),
+            new_inode_id,
+            cookie,
+            Some(&new_file_inode),
+        );
+        
+        // Save the new inode
+        fs_ref
+            .inode_store
+            .save(&mut txn, new_inode_id, &new_file_inode)
+            .map_err(|e| Status::internal(format!("Failed to save inode: {}", e)))?;
+        
+        // Update parent directory metadata
+        let mut dest_dir_inode_obj = fs_ref
+            .inode_store
+            .get(dest_dir_inode)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get dest dir inode: {}", e)))?;
+        
+        if let Inode::Directory(ref mut dir) = dest_dir_inode_obj {
+            dir.entry_count += 1;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            dir.mtime = now;
+            dir.mtime_nsec = 0;
+            dir.ctime = now;
+            dir.ctime_nsec = 0;
+        }
+        
+        fs_ref
+            .inode_store
+            .save(&mut txn, dest_dir_inode, &dest_dir_inode_obj)
+            .map_err(|e| Status::internal(format!("Failed to save dest dir: {}", e)))?;
+        
+        // Commit with bypass cache for immediate visibility
+        let mut seq_guard = fs_ref.write_coordinator.allocate_sequence();
+        fs_ref
+            .commit_transaction_internal(txn, &mut seq_guard, true)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit: {}", e)))?;
+        
+        tracing::info!(
+            "Instant restore complete: created new inode {} sharing data with snapshot inode {}, size {}, in dir {}",
+            new_inode_id,
             current_inode,
             file_size,
-            updated_nlink
+            dest_dir_inode
         );
 
         Ok(Response::new(proto::InstantRestoreFileResponse {
-            inode_id: current_inode,
+            inode_id: new_inode_id,
             file_size,
-            nlink: updated_nlink,
+            nlink: 1, // New file starts with nlink=1
         }))
     }
 }

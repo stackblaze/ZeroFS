@@ -111,15 +111,46 @@ impl DirectoryStore {
 
     pub async fn get(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
         let entry_key = KeyCodec::dir_entry_key(dir_id, name);
+        let name_str = String::from_utf8_lossy(name);
+
+        tracing::debug!(
+            "directory_store.get: looking up '{}' in dir_id={}, key={:?}",
+            name_str,
+            dir_id,
+            entry_key
+        );
 
         let entry_data = self
             .db
             .get_bytes(&entry_key)
             .await
-            .map_err(|_| FsError::IoError)?
-            .ok_or(FsError::NotFound)?;
+            .map_err(|e| {
+                tracing::error!(
+                    "directory_store.get: db.get_bytes failed for '{}' in dir {}: {:?}",
+                    name_str,
+                    dir_id,
+                    e
+                );
+                FsError::IoError
+            })?
+            .ok_or_else(|| {
+                tracing::error!(
+                    "directory_store.get: entry not found for '{}' in dir {}",
+                    name_str,
+                    dir_id
+                );
+                FsError::NotFound
+            })?;
 
         let (inode_id, _cookie) = KeyCodec::decode_dir_entry(&entry_data)?;
+        
+        tracing::debug!(
+            "directory_store.get: found '{}' in dir {} -> inode {}",
+            name_str,
+            dir_id,
+            inode_id
+        );
+        
         Ok(inode_id)
     }
 

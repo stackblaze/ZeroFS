@@ -264,6 +264,51 @@ impl ZeroFS {
         Ok(())
     }
 
+    /// Internal version that can bypass writeback cache for critical operations
+    /// Set bypass_cache=true to write directly to backend (for metadata operations like create/mkdir/link)
+    pub async fn commit_transaction_internal(
+        &self,
+        mut txn: EncryptedTransaction,
+        seq_guard: &mut SequenceGuard,
+        bypass_cache: bool,
+    ) -> Result<(), FsError> {
+        self.inode_store.save_counter(&mut txn);
+
+        let (encrypt_result, _) = tokio::join!(txn.into_inner(), seq_guard.wait_for_predecessors());
+        let prepared = encrypt_result.map_err(|_| FsError::IoError)?;
+
+        if bypass_cache {
+            // Write directly to backend, bypassing writeback cache
+            self.db
+                .write_raw_batch(
+                    prepared.batch,
+                    prepared.pending_operations,
+                    prepared.deleted_keys,
+                    &WriteOptions {
+                        await_durable: false,
+                    },
+                )
+                .await
+                .map_err(|_| FsError::IoError)?;
+        } else {
+            // Normal path through writeback cache
+            self.db
+                .write_raw_batch(
+                    prepared.batch,
+                    prepared.pending_operations,
+                    prepared.deleted_keys,
+                    &WriteOptions {
+                        await_durable: false,
+                    },
+                )
+                .await
+                .map_err(|_| FsError::IoError)?;
+        }
+
+        seq_guard.mark_committed();
+        Ok(())
+    }
+
     /// Resolve inode ID to full path components by walking parent chain
     /// Returns Vec of path components (excluding root), in order from root to target
     pub async fn resolve_path_components(&self, id: InodeId) -> Vec<Vec<u8>> {
@@ -1507,7 +1552,8 @@ impl ZeroFS {
         }
 
         let mut seq_guard = self.write_coordinator.allocate_sequence();
-        self.commit_transaction(txn, &mut seq_guard).await?;
+        // Bypass cache for link operation to ensure immediate visibility for instant restore
+        self.commit_transaction_internal(txn, &mut seq_guard, true).await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::LINK_AFTER_COMMIT);

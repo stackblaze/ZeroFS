@@ -198,4 +198,15 @@ impl WritebackCache {
     pub fn trigger_flush(&self) {
         let _ = self.flush_tx.send(FlushSignal::Manual);
     }
+
+    /// Synchronously flush all pending batches to backend
+    /// Used for operations that need immediate consistency (e.g., instant restore)
+    pub async fn flush_now(&self, db: &EncryptedDb) -> Result<(), FsError> {
+        self.flush_to_backend(db).await
+    }
+
+    /// Check if there are pending writes
+    pub fn has_pending(&self) -> bool {
+        !self.pending_batches.is_empty()
+    }
 }
