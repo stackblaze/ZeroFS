@@ -844,6 +844,18 @@ pub async fn run_server(
     )
     .await;
 
+    // Start HTTP REST API server (wraps RPC calls)
+    let http_handles = if let Some(ref rpc_config) = settings.servers.rpc {
+        crate::http::start_http_servers(
+            settings.servers.http.as_ref(),
+            rpc_config.clone(),
+            shutdown.clone(),
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+
     let gc_handle = if !db_mode.is_read_only() {
         let gc = Arc::new(GarbageCollector::new(
             Arc::clone(&fs.db),
@@ -880,10 +892,11 @@ pub async fn run_server(
     server_handles.extend(ninep_handles);
     server_handles.extend(nbd_handles);
     server_handles.extend(rpc_handles);
+    server_handles.extend(http_handles);
 
     if server_handles.is_empty() {
         return Err(anyhow::anyhow!(
-            "No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled."
+            "No servers configured. At least one server (NFS, 9P, NBD, RPC, or HTTP) must be enabled."
         ));
     }
 

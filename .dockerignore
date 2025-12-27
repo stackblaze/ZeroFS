@@ -1,0 +1,5 @@
+zerofs/target/
+zerofs/.git/
+.git/
+*.md
+.github/

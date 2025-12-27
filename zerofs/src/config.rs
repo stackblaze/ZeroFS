@@ -287,6 +287,8 @@ pub struct ServerConfig {
     pub nbd: Option<NbdConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpc: Option<RpcConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -333,6 +335,13 @@ pub struct RpcConfig {
         default
     )]
     pub unix_socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConfig {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub addresses: Option<HashSet<SocketAddr>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -552,6 +561,16 @@ impl Settings {
                 rpc: Some(RpcConfig {
                     addresses: Some(default_rpc_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.rpc.sock")),
+                }),
+                http: Some(HttpConfig {
+                    addresses: Some({
+                        let mut set = HashSet::new();
+                        set.insert(SocketAddr::new(
+                            IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                            8080,
+                        ));
+                        set
+                    }),
                 }),
             },
             filesystem: None,

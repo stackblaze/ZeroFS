@@ -16,6 +16,7 @@ mod nfs;
 mod ninep;
 mod parse_object_store;
 mod rpc;
+mod http;
 mod storage_compatibility;
 mod task;
 

@@ -59,9 +59,9 @@ fn encode_dir_scan_value(name: &[u8], value: &DirScanValue) -> Bytes {
 fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsError> {
     // Try new format first (name_len u32 + name + DirScanValue)
     if data.len() >= 4 {
-        let name_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+    let name_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
         if data.len() >= 4 + name_len {
-            let name = data[4..4 + name_len].to_vec();
+    let name = data[4..4 + name_len].to_vec();
             let value_data = &data[4 + name_len..];
 
             // Try to deserialize as DirScanValue enum

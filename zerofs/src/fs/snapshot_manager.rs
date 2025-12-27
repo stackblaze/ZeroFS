@@ -66,7 +66,7 @@ impl SnapshotManager {
 
         info!("Creating /snapshots root directory");
         let (now_sec, _) = get_current_time();
-
+        
         // Create the snapshots directory inode
         let snapshots_dir = Inode::Directory(DirectoryInode {
             mtime: now_sec,
@@ -89,15 +89,15 @@ impl SnapshotManager {
         let key = KeyCodec::inode_key(SNAPSHOTS_ROOT_INODE);
         self.db
             .put_with_options(
-                &key,
-                &serialized,
-                &slatedb::config::PutOptions::default(),
+            &key,
+            &serialized,
+            &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
 
         // Add entry in root directory pointing to /snapshots
         let cookie_key = KeyCodec::dir_cookie_counter_key(root_dir_inode);
@@ -108,33 +108,33 @@ impl SnapshotManager {
             }
             _ => crate::fs::store::directory::COOKIE_FIRST_ENTRY,
         };
-
+        
         let new_cookie = cookie + 1;
         self.db
             .put_with_options(
-                &cookie_key,
-                &new_cookie.to_be_bytes(),
-                &slatedb::config::PutOptions::default(),
+            &cookie_key,
+            &new_cookie.to_be_bytes(),
+            &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
 
         // Add directory entry
         let entry_key = KeyCodec::dir_entry_key(root_dir_inode, b"snapshots");
         self.db
             .put_with_options(
-                &entry_key,
-                &SNAPSHOTS_ROOT_INODE.to_be_bytes(),
-                &slatedb::config::PutOptions::default(),
+            &entry_key,
+            &SNAPSHOTS_ROOT_INODE.to_be_bytes(),
+            &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
 
         let scan_key = KeyCodec::dir_scan_key(root_dir_inode, cookie);
         let scan_value = DirScanValue::Reference {
@@ -143,15 +143,15 @@ impl SnapshotManager {
         let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
         self.db
             .put_with_options(
-                &scan_key,
+            &scan_key,
                 &scan_value_bytes,
-                &slatedb::config::PutOptions::default(),
+            &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
 
         info!("Created /snapshots directory at root");
         Ok(())
@@ -172,7 +172,7 @@ impl SnapshotManager {
         // The snapshot already has a root inode, we just need to add it to /snapshots directory
         // First, update the snapshot root's parent to point to snapshots directory
         let mut snapshot_root = self.inode_store.get(snapshot_root_inode).await?;
-
+        
         if let Inode::Directory(dir) = &mut snapshot_root {
             dir.parent = SNAPSHOTS_ROOT_INODE;
             dir.name = Some(snapshot_name.as_bytes().to_vec());
@@ -185,15 +185,15 @@ impl SnapshotManager {
         let key = KeyCodec::inode_key(snapshot_root_inode);
         self.db
             .put_with_options(
-                &key,
-                &serialized,
-                &slatedb::config::PutOptions::default(),
+            &key,
+            &serialized,
+            &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
 
         // Add directory entry in /snapshots/ pointing to the snapshot root
         let cookie_key = KeyCodec::dir_cookie_counter_key(SNAPSHOTS_ROOT_INODE);
@@ -204,32 +204,32 @@ impl SnapshotManager {
             }
             _ => crate::fs::store::directory::COOKIE_FIRST_ENTRY,
         };
-
+        
         let new_cookie = cookie + 1;
         self.db
             .put_with_options(
-                &cookie_key,
-                &new_cookie.to_be_bytes(),
-                &slatedb::config::PutOptions::default(),
+            &cookie_key,
+            &new_cookie.to_be_bytes(),
+            &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
 
         let entry_key = KeyCodec::dir_entry_key(SNAPSHOTS_ROOT_INODE, snapshot_name.as_bytes());
         self.db
             .put_with_options(
-                &entry_key,
-                &snapshot_root_inode.to_be_bytes(),
-                &slatedb::config::PutOptions::default(),
+            &entry_key,
+            &snapshot_root_inode.to_be_bytes(),
+            &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
 
         let scan_key = KeyCodec::dir_scan_key(SNAPSHOTS_ROOT_INODE, cookie);
         let scan_value = DirScanValue::Reference {
@@ -238,15 +238,15 @@ impl SnapshotManager {
         let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
         self.db
             .put_with_options(
-                &scan_key,
+            &scan_key,
                 &scan_value_bytes,
-                &slatedb::config::PutOptions::default(),
+            &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
 
         // Update /snapshots directory metadata
         let mut snapshots_dir_inode = self.inode_store.get(SNAPSHOTS_ROOT_INODE).await?;
@@ -261,15 +261,15 @@ impl SnapshotManager {
         let key = KeyCodec::inode_key(SNAPSHOTS_ROOT_INODE);
         self.db
             .put_with_options(
-                &key,
-                &serialized,
-                &slatedb::config::PutOptions::default(),
+            &key,
+            &serialized,
+            &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
 
         info!("Created snapshot directory: /snapshots/{}", snapshot_name);
         Ok(())
@@ -311,7 +311,7 @@ impl SnapshotManager {
             .get_by_name(name)
             .await
             .ok_or(FsError::NotFound)?;
-
+        
         self.dataset_store.delete_dataset(dataset.id).await?;
         Ok(())
     }
@@ -323,7 +323,7 @@ impl SnapshotManager {
             .get_by_name(name)
             .await
             .ok_or(FsError::NotFound)?;
-
+        
         self.dataset_store.set_default(dataset.id).await
     }
 
@@ -345,7 +345,7 @@ impl SnapshotManager {
             .get_by_name(source_name)
             .await
             .ok_or(FsError::NotFound)?;
-
+        
         self.create_snapshot(source.id, snapshot_name, created_at, is_readonly)
             .await
     }
@@ -357,11 +357,11 @@ impl SnapshotManager {
             .get_by_name(name)
             .await
             .ok_or(FsError::NotFound)?;
-
+        
         if !snapshot.is_snapshot {
             return Err(FsError::InvalidArgument);
         }
-
+        
         self.delete_snapshot(snapshot.id).await
     }
 
@@ -397,10 +397,10 @@ impl SnapshotManager {
 
         // Clone the root inode of the source dataset
         let source_root_inode = self.inode_store.get(source.root_inode).await?;
-
+        
         // Create a new inode for the snapshot root
         let snapshot_root_id = self.inode_store.allocate();
-
+        
         // Clone the directory inode
         let snapshot_root = match source_root_inode {
             Inode::Directory(dir) => {
@@ -432,15 +432,15 @@ impl SnapshotManager {
         let key = KeyCodec::inode_key(snapshot_root_id);
         self.db
             .put_with_options(
-                &key,
-                &serialized,
-                &slatedb::config::PutOptions::default(),
+            &key,
+            &serialized,
+            &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
                     await_durable: false,
                 },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
 
         // Create the snapshot metadata in dataset store
         let snapshot = self
@@ -457,7 +457,7 @@ impl SnapshotManager {
         // Clone directory entries (COW - they reference the same inodes)
         self.clone_directory_entries(source.root_inode, snapshot_root_id)
             .await?;
-
+        
         // Flush to ensure all entries are persisted
         self.db.flush().await.map_err(|_| FsError::IoError)?;
 
@@ -485,7 +485,7 @@ impl SnapshotManager {
         let mut entries: Vec<(Vec<u8>, InodeId, u64)> = vec![];
         let mut count = 0;
         const MAX_ENTRIES: usize = 100000; // Safety limit
-
+        
         let stream = self.directory_store.list_from(source_dir_id, 0).await?;
         pin_mut!(stream);
 
@@ -498,11 +498,11 @@ impl SnapshotManager {
                 );
                 return Err(FsError::IoError);
             }
-
+            
             let entry = result?;
             entries.push((entry.name.clone(), entry.inode_id, entry.cookie));
             count += 1;
-
+            
             if count % 100 == 0 {
                 tracing::debug!("Scanned {} entries from directory {}", count, source_dir_id);
             }
@@ -525,7 +525,7 @@ impl SnapshotManager {
                 source_dir_id,
                 dest_dir_id
             );
-
+            
             // Create dir_entry key for destination
             let entry_key = KeyCodec::dir_entry_key(dest_dir_id, &name);
             let entry_value = KeyCodec::encode_dir_entry(inode_id, cookie);
@@ -538,15 +538,15 @@ impl SnapshotManager {
             );
             self.db
                 .put_with_options(
-                    &entry_key,
-                    &entry_value,
-                    &slatedb::config::PutOptions::default(),
+                &entry_key,
+                &entry_value,
+                &slatedb::config::PutOptions::default(),
                     &slatedb::config::WriteOptions {
                         await_durable: false,
                     },
-                )
-                .await
-                .map_err(|_| FsError::IoError)?;
+            )
+            .await
+            .map_err(|_| FsError::IoError)?;
 
             // Create dir_scan key for destination
             let scan_key = KeyCodec::dir_scan_key(dest_dir_id, cookie);
@@ -554,16 +554,16 @@ impl SnapshotManager {
             let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
             self.db
                 .put_with_options(
-                    &scan_key,
+                &scan_key,
                     &scan_value_bytes,
-                    &slatedb::config::PutOptions::default(),
+                &slatedb::config::PutOptions::default(),
                     &slatedb::config::WriteOptions {
                         await_durable: false,
                     },
-                )
-                .await
-                .map_err(|_| FsError::IoError)?;
-
+            )
+            .await
+            .map_err(|_| FsError::IoError)?;
+            
             // Verify the entry was written and is readable
             let verify = self
                 .db
@@ -591,15 +591,15 @@ impl SnapshotManager {
             let inode_key = KeyCodec::inode_key(inode_id);
             self.db
                 .put_with_options(
-                    &inode_key,
-                    &serialized,
-                    &slatedb::config::PutOptions::default(),
+                &inode_key,
+                &serialized,
+                &slatedb::config::PutOptions::default(),
                     &slatedb::config::WriteOptions {
                         await_durable: false,
                     },
-                )
-                .await
-                .map_err(|_| FsError::IoError)?;
+            )
+            .await
+            .map_err(|_| FsError::IoError)?;
         }
 
         // Clone the cookie counter
@@ -613,17 +613,17 @@ impl SnapshotManager {
             let dest_counter_key = KeyCodec::dir_cookie_counter_key(dest_dir_id);
             self.db
                 .put_with_options(
-                    &dest_counter_key,
-                    &counter_data,
-                    &slatedb::config::PutOptions::default(),
+                &dest_counter_key,
+                &counter_data,
+                &slatedb::config::PutOptions::default(),
                     &slatedb::config::WriteOptions {
                         await_durable: false,
                     },
-                )
-                .await
-                .map_err(|_| FsError::IoError)?;
+            )
+            .await
+            .map_err(|_| FsError::IoError)?;
         }
-
+        
         tracing::info!(
             "Successfully cloned and verified all {} entries from inode {} to inode {}",
             num_entries,

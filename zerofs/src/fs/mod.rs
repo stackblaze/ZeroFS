@@ -194,7 +194,7 @@ impl ZeroFS {
         let directory_store = DirectoryStore::new(db.clone());
         let inode_store = InodeStore::new(db.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone());
-
+        
         // Initialize dataset store
         let (created_sec, _) = get_current_time();
         let dataset_store = DatasetStore::new(db.clone(), ROOT_INODE_ID, created_sec).await?;
@@ -260,9 +260,9 @@ impl ZeroFS {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        seq_guard.mark_committed();
+            seq_guard.mark_committed();
         Ok(())
-    }
+        }
 
     /// Internal version that can bypass writeback cache for critical operations
     /// Set bypass_cache=true to write directly to backend (for metadata operations like create/mkdir/link)
@@ -279,17 +279,17 @@ impl ZeroFS {
 
         if bypass_cache {
             // Write directly to backend, bypassing writeback cache
-            self.db
-                .write_raw_batch(
+        self.db
+            .write_raw_batch(
                     prepared.batch,
                     prepared.pending_operations,
                     prepared.deleted_keys,
-                    &WriteOptions {
-                        await_durable: false,
-                    },
-                )
-                .await
-                .map_err(|_| FsError::IoError)?;
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .map_err(|_| FsError::IoError)?;
         } else {
             // Normal path through writeback cache
             self.db
@@ -1210,7 +1210,7 @@ impl ZeroFS {
                     .collect();
 
                 if !lookup_indices.is_empty() {
-                    const BUFFER_SIZE: usize = 256;
+                const BUFFER_SIZE: usize = 256;
 
                     let lookup_entries: Vec<_> = lookup_indices
                         .iter()
@@ -1221,23 +1221,23 @@ impl ZeroFS {
                         |(idx, inode_id)| async move {
                             match self.inode_store.get(inode_id).await {
                                 Ok(inode) => Ok::<_, FsError>((idx, Some(inode))),
-                                Err(FsError::NotFound) => {
-                                    debug!("readdir: skipping deleted entry (inode {})", inode_id);
+                            Err(FsError::NotFound) => {
+                                debug!("readdir: skipping deleted entry (inode {})", inode_id);
                                     Ok((idx, None))
-                                }
-                                Err(e) => {
-                                    error!("readdir: failed to load inode {}: {:?}", inode_id, e);
-                                    Err(e)
-                                }
                             }
-                        },
-                    );
+                            Err(e) => {
+                                error!("readdir: failed to load inode {}: {:?}", inode_id, e);
+                                Err(e)
+                            }
+                        }
+                    },
+                );
 
                     let loaded_inodes: Vec<_> = inode_futures
-                        .buffered(BUFFER_SIZE)
-                        .collect::<Vec<_>>()
-                        .await
-                        .into_iter()
+                    .buffered(BUFFER_SIZE)
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
                         .collect::<Result<Vec<_>, _>>()?;
 
                     for (idx, inode_opt) in loaded_inodes {
@@ -1247,16 +1247,16 @@ impl ZeroFS {
 
                 for (inode_id, name, cookie, inode_opt) in dir_entries {
                     if let Some(inode) = inode_opt {
-                        entries.push(DirEntry {
-                            fileid: inode_id,
-                            name,
-                            attr: InodeWithId {
-                                inode: &inode,
-                                id: inode_id,
-                            }
-                            .into(),
-                            cookie,
-                        });
+                    entries.push(DirEntry {
+                        fileid: inode_id,
+                        name,
+                        attr: InodeWithId {
+                            inode: &inode,
+                            id: inode_id,
+                        }
+                        .into(),
+                        cookie,
+                    });
                     }
                 }
 

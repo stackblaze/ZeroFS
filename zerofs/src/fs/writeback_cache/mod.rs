@@ -98,7 +98,7 @@ impl WritebackCache {
 
     pub async fn write(&self, batch: WriteBatch) -> Result<TxnId, FsError> {
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
-
+        
         // Estimate batch size - use approximate size
         // Since we can't access WriteBatch internals, estimate based on common patterns
         let size_bytes = 1000; // Conservative estimate for a batch

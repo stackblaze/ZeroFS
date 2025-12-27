@@ -75,6 +75,8 @@ tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 chrono = "0.4"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 fail = { version = "0.5", features = ["failpoints"], optional = true }
 
 [build-dependencies]

@@ -37,6 +37,130 @@ impl AdminRpcServer {
             fs,
         }
     }
+
+    /// Recursively clone directory contents from snapshot to live filesystem
+    /// This performs true COW - all inodes and data chunks are shared until modified
+    async fn clone_directory_recursive(
+        &self,
+        source_dir_inode: u64,
+        dest_dir_inode: u64,
+        snapshot: &crate::fs::dataset::Dataset,
+    ) -> Result<(), Status> {
+        use tokio_stream::StreamExt;
+
+        tracing::info!(
+            "Cloning directory contents from snapshot '{}': source_inode={}, dest_inode={}",
+            snapshot.name,
+            source_dir_inode,
+            dest_dir_inode
+        );
+
+        // List all entries in the source directory from the snapshot
+        let mut stream = self.fs.directory_store.list_from(source_dir_inode, 0).await
+            .map_err(|e| Status::internal(format!("Failed to list directory: {}", e)))?;
+
+        let mut entries = Vec::new();
+        while let Some(result) = stream.next().await {
+            let entry = result.map_err(|e| Status::internal(format!("Failed to read entry: {}", e)))?;
+            entries.push(entry);
+        }
+
+        let num_entries = entries.len();
+        tracing::info!(
+            "Found {} entries in source directory {}",
+            num_entries,
+            source_dir_inode
+        );
+
+        // Clone each entry
+        for entry in entries {
+            let name = String::from_utf8_lossy(&entry.name).to_string();
+            
+            // Skip . and .. entries
+            if name == "." || name == ".." {
+                continue;
+            }
+
+            tracing::debug!(
+                "Cloning entry '{}' (inode {}) from snapshot",
+                name,
+                entry.inode_id
+            );
+
+            // Get the inode from the snapshot
+            let source_inode = self.fs.inode_store.get(entry.inode_id).await
+                .map_err(|e| Status::internal(format!("Failed to get inode {}: {}", entry.inode_id, e)))?;
+            
+            // Allocate a new inode ID in the live filesystem
+            let new_inode_id = self.fs.inode_store.allocate();
+            
+            // Clone the inode metadata
+            let new_inode = source_inode.clone();
+            let is_directory = matches!(new_inode, crate::fs::inode::Inode::Directory(_));
+            
+            // Create transaction
+            let mut txn = self.fs.db.new_transaction()
+                .map_err(|e| Status::internal(format!("Failed to create transaction: {}", e)))?;
+            
+            // Allocate cookie for directory entry
+            let cookie = self.fs
+                .directory_store
+                .allocate_cookie(dest_dir_inode, &mut txn)
+                .await
+                .map_err(|e| Status::internal(format!("Failed to allocate cookie: {}", e)))?;
+            
+            // Add directory entry
+            self.fs.directory_store.add(
+                &mut txn,
+                dest_dir_inode,
+                entry.name.as_slice(),
+                new_inode_id,
+                cookie,
+                Some(&new_inode),
+            );
+            
+            // Save the new inode
+            self.fs
+                .inode_store
+                .save(&mut txn, new_inode_id, &new_inode)
+                .map_err(|e| Status::internal(format!("Failed to save inode: {}", e)))?;
+            
+            // Commit transaction
+            let mut seq_guard = self.fs.write_coordinator.allocate_sequence();
+            self.fs
+                .commit_transaction_internal(txn, &mut seq_guard, true)
+                .await
+                .map_err(|e| Status::internal(format!("Failed to commit: {}", e)))?;
+
+            tracing::debug!(
+                "Cloned '{}': snapshot inode {} -> new inode {}",
+                name,
+                entry.inode_id,
+                new_inode_id
+            );
+
+            // If this is a directory, recursively clone its contents
+            if is_directory {
+                tracing::info!(
+                    "Recursively cloning subdirectory '{}' (snapshot inode {} -> new inode {})",
+                    name,
+                    entry.inode_id,
+                    new_inode_id
+                );
+                Box::pin(self.clone_directory_recursive(entry.inode_id, new_inode_id, snapshot))
+                    .await?;
+            }
+        }
+
+        tracing::info!(
+            "Completed cloning {} entries from directory {} to {}",
+            num_entries,
+            source_dir_inode,
+            dest_dir_inode
+        );
+
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -234,7 +358,15 @@ impl AdminService for AdminRpcServer {
             .snapshot_manager
             .create_snapshot_by_name(&req.source_name, req.snapshot_name, created_at, is_readonly)
             .await
-            .map_err(|e| Status::internal(format!("Failed to create snapshot: {}", e)))?;
+            .map_err(|e| {
+                let error_msg = match e {
+                    crate::fs::errors::FsError::NotFound => {
+                        format!("Dataset '{}' not found. Use ListDatasets RPC to see available datasets.", req.source_name)
+                    }
+                    _ => format!("Failed to create snapshot: {}", e),
+                };
+                Status::internal(error_msg)
+            })?;
 
         Ok(Response::new(proto::CreateSnapshotResponse {
             snapshot: Some(snapshot.into()),
@@ -479,11 +611,20 @@ impl AdminService for AdminRpcServer {
         let mut current_inode = snapshot_root;
         let fs_ref = self.fs.clone();
 
-        // Navigate to the parent directory (all parts except the last, which is the filename)
-        let dir_parts = &source_parts[0..source_parts.len() - 1];
-        let filename = source_parts[source_parts.len() - 1];
-
-        for part in dir_parts {
+        // Navigate through the ENTIRE path to find the source file/directory
+        // For files: /volumes/pvc-xxx/file.txt -> navigate through volumes, pvc-xxx, then get file.txt
+        // For directories: /volumes/pvc-xxx -> navigate through volumes, then get pvc-xxx
+        for (idx, part) in source_parts.iter().enumerate() {
+            let is_last = idx == source_parts.len() - 1;
+            
+            tracing::info!(
+                "Navigating: part '{}' ({}/{}) in inode {}",
+                part,
+                idx + 1,
+                source_parts.len(),
+                current_inode
+            );
+            
             let inode = fs_ref.inode_store.get(current_inode).await.map_err(|e| {
                 Status::internal(format!("Failed to read inode {}: {}", current_inode, e))
             })?;
@@ -495,8 +636,24 @@ impl AdminService for AdminRpcServer {
                         .get(current_inode, part.as_bytes())
                         .await
                         .map_err(|e| {
-                            Status::not_found(format!("Path component '{}' not found: {}", part, e))
+                            tracing::error!(
+                                "Failed to find '{}' in directory inode {}: {:?}",
+                                part,
+                                current_inode,
+                                e
+                            );
+                            Status::not_found(format!(
+                                "Path component '{}' not found in directory: {}",
+                                part, e
+                            ))
                         })?;
+                    
+                    tracing::info!(
+                        "Found '{}' -> inode {}{}",
+                        part,
+                        current_inode,
+                        if is_last { " (target)" } else { "" }
+                    );
                 }
                 _ => {
                     return Err(Status::invalid_argument(format!(
@@ -507,45 +664,28 @@ impl AdminService for AdminRpcServer {
             }
         }
 
-        // Now look up the filename in the parent directory
-        tracing::info!(
-            "Looking up filename '{}' in snapshot dir inode {}",
-            filename,
-            current_inode
-        );
-        
-        current_inode = fs_ref
-            .directory_store
-            .get(current_inode, filename.as_bytes())
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    "Failed to find '{}' in snapshot dir {}: {:?}",
-                    filename,
-                    current_inode,
-                    e
-                );
-                Status::not_found(format!("File '{}' not found in directory: {}", filename, e))
-            })?;
-
-        // current_inode is now the source file inode (from snapshot)
-        let source_file_inode = fs_ref
+        // current_inode is now the source inode (from snapshot) - can be file or directory
+        let source_inode = fs_ref
             .inode_store
             .get(current_inode)
             .await
-            .map_err(|e| Status::internal(format!("Failed to read file inode: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to read source inode: {}", e)))?;
 
-        let (file_size, file_nlink) = match &source_file_inode {
+        // Check if it's a file or directory
+        let is_directory = matches!(&source_inode, Inode::Directory(_));
+        let (file_size, file_nlink) = match &source_inode {
             Inode::File(file) => (file.size, file.nlink),
+            Inode::Directory(_) => (0, 1), // Directories don't have size
             _ => {
                 return Err(Status::invalid_argument(
-                    "Source path does not point to a file",
+                    "Source path must be a file or directory",
                 ));
             }
         };
 
         tracing::info!(
-            "Source file inode {} size={} nlink={} - will copy to new inode in root dataset",
+            "Source {} inode {} size={} nlink={} - will copy to new inode in root dataset",
+            if is_directory { "directory" } else { "file" },
             current_inode,
             file_size,
             file_nlink
@@ -602,8 +742,8 @@ impl AdminService for AdminRpcServer {
             }
         }
 
-        // Use root auth context for instant restore
-        let auth = AuthContext {
+        // Use root auth context for instant restore (if needed in future)
+        let _auth = AuthContext {
             uid: 0,
             gid: 0,
             gids: vec![],
@@ -619,18 +759,29 @@ impl AdminService for AdminRpcServer {
         // Allocate a new inode ID in the root dataset
         let new_inode_id = fs_ref.inode_store.allocate();
         
-        // Clone the file inode but with new metadata for the root dataset
-        let mut new_file_inode = source_file_inode.clone();
-        if let Inode::File(ref mut file) = new_file_inode {
-            file.nlink = 1; // New inode starts with nlink=1
-            file.parent = Some(dest_dir_inode);
-            file.name = Some(filename.as_bytes().to_vec());
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            file.ctime = now;
-            file.ctime_nsec = 0;
+        // Clone the inode (file or directory) but with new metadata for the root dataset
+        let mut new_inode = source_inode.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+            
+        match &mut new_inode {
+            Inode::File(file) => {
+                file.nlink = 1; // New inode starts with nlink=1
+                file.parent = Some(dest_dir_inode);
+                file.name = Some(filename.as_bytes().to_vec());
+                file.ctime = now;
+                file.ctime_nsec = 0;
+            }
+            Inode::Directory(dir) => {
+                // For directories, update metadata but keep entry_count
+                dir.ctime = now;
+                dir.ctime_nsec = 0;
+                dir.mtime = now;
+                dir.mtime_nsec = 0;
+            }
+            _ => {}
         }
         
         // Create transaction to add the new inode
@@ -652,14 +803,20 @@ impl AdminService for AdminRpcServer {
             filename.as_bytes(),
             new_inode_id,
             cookie,
-            Some(&new_file_inode),
+            Some(&new_inode),
         );
         
         // Save the new inode
         fs_ref
             .inode_store
-            .save(&mut txn, new_inode_id, &new_file_inode)
+            .save(&mut txn, new_inode_id, &new_inode)
             .map_err(|e| Status::internal(format!("Failed to save inode: {}", e)))?;
+        
+        // If it's a directory, clone its entries recursively
+        if is_directory {
+            tracing::info!("Cloning directory entries from {} to {}", current_inode, new_inode_id);
+            // Clone directory entries will be done after transaction commit
+        }
         
         // Update parent directory metadata
         let mut dest_dir_inode_obj = fs_ref
@@ -667,7 +824,7 @@ impl AdminService for AdminRpcServer {
             .get(dest_dir_inode)
             .await
             .map_err(|e| Status::internal(format!("Failed to get dest dir inode: {}", e)))?;
-        
+
         if let Inode::Directory(ref mut dir) = dest_dir_inode_obj {
             dir.entry_count += 1;
             let now = std::time::SystemTime::now()
@@ -691,7 +848,15 @@ impl AdminService for AdminRpcServer {
             .commit_transaction_internal(txn, &mut seq_guard, true)
             .await
             .map_err(|e| Status::internal(format!("Failed to commit: {}", e)))?;
-        
+
+        // If it's a directory, recursively clone its contents AFTER the transaction is committed
+        if is_directory {
+            tracing::info!("Starting recursive clone of directory entries from {} to {}", current_inode, new_inode_id);
+            self.clone_directory_recursive(current_inode, new_inode_id, &snapshot)
+                .await?;
+            tracing::info!("Completed recursive clone of directory from {} to {}", current_inode, new_inode_id);
+        }
+
         tracing::info!(
             "Instant restore complete: created new inode {} sharing data with snapshot inode {}, size {}, in dir {}",
             new_inode_id,
