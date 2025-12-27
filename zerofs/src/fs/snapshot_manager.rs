@@ -527,6 +527,18 @@ impl SnapshotManager {
         );
         for (name, inode_id, cookie) in entries {
             let name_str = String::from_utf8_lossy(&name);
+            
+            // Skip entries with invalid inode IDs
+            const MAX_VALID_INODE: u64 = 0xFFFF_FFFF;
+            if inode_id > MAX_VALID_INODE {
+                tracing::warn!(
+                    "Skipping entry '{}' with invalid inode_id={} during snapshot clone",
+                    name_str,
+                    inode_id
+                );
+                continue;
+            }
+            
             tracing::debug!(
                 "Cloning entry '{}' (inode {}) from {} to {}",
                 name_str,
