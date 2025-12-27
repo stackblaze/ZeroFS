@@ -1,5 +1,6 @@
 use crate::checkpoint_manager::CheckpointManager;
 use crate::fs::ZeroFS;
+use crate::fs::errors::FsError;
 use crate::fs::snapshot_manager::SnapshotManager;
 use crate::fs::tracing::AccessTracer;
 use crate::rpc::proto::{self, admin_service_server::AdminService};
@@ -61,7 +62,15 @@ impl AdminRpcServer {
 
         let mut entries = Vec::new();
         while let Some(result) = stream.next().await {
-            let entry = result.map_err(|e| Status::internal(format!("Failed to read entry: {}", e)))?;
+            // Skip corrupted entries (InvalidData errors)
+            let entry = match result {
+                Ok(e) => e,
+                Err(e) if matches!(e, FsError::InvalidData) => {
+                    tracing::warn!("Skipping corrupted entry in directory {}", source_dir_inode);
+                    continue;
+                }
+                Err(e) => return Err(Status::internal(format!("Failed to read entry: {}", e))),
+            };
             entries.push(entry);
         }
 

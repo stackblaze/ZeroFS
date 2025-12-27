@@ -75,6 +75,20 @@ fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsError
     if data.len() >= 8 {
         let inode_id = u64::from_le_bytes(data[..8].try_into().unwrap());
         let name = data[8..].to_vec();
+        
+        // Skip corrupted entries with invalid inode IDs
+        // Valid inode IDs should be < 2^32 in most cases
+        const MAX_VALID_INODE: u64 = 0xFFFF_FFFF; // 2^32 - 1
+        if inode_id > MAX_VALID_INODE {
+            warn!(
+                "Skipping corrupted directory entry '{}' with invalid inode_id={} (exceeds max {})",
+                String::from_utf8_lossy(&name),
+                inode_id,
+                MAX_VALID_INODE
+            );
+            return Err(FsError::InvalidData);
+        }
+        
         warn!(
             "Reading directory entry '{}' in legacy format (inode_id={}), will be upgraded on next write",
             String::from_utf8_lossy(&name),

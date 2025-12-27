@@ -499,7 +499,16 @@ impl SnapshotManager {
                 return Err(FsError::IoError);
             }
             
-            let entry = result?;
+            // Skip corrupted entries (InvalidData error from decode)
+            let entry = match result {
+                Ok(e) => e,
+                Err(FsError::InvalidData) => {
+                    tracing::warn!("Skipping corrupted entry in directory {}", source_dir_id);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            
             entries.push((entry.name.clone(), entry.inode_id, entry.cookie));
             count += 1;
             

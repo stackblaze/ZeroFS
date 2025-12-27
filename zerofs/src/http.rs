@@ -97,9 +97,21 @@ struct HealthResponse {
 
 // Helper to create RPC client
 async fn get_rpc_client(state: &AppState) -> Result<RpcClient, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(
+        "Attempting to connect to RPC server: unix_socket={:?}, addresses={:?}",
+        state.rpc_config.unix_socket,
+        state.rpc_config.addresses
+    );
+    
     RpcClient::connect_from_config(&state.rpc_config)
         .await
         .map_err(|e| {
+            tracing::error!(
+                "Failed to connect to RPC server (unix_socket={:?}, addresses={:?}): {}",
+                state.rpc_config.unix_socket,
+                state.rpc_config.addresses,
+                e
+            );
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse {
@@ -512,7 +524,7 @@ pub async fn start_http_servers(
         for &addr in addresses {
             info!("Starting HTTP REST API server on {}", addr);
             let router = create_router(rpc_config.clone());
-            let mut shutdown_rx = shutdown.clone().cancelled_owned();
+            let shutdown_rx = shutdown.clone().cancelled_owned();
             handles.push(tokio::spawn(async move {
                 let listener = tokio::net::TcpListener::bind(addr)
                     .await
