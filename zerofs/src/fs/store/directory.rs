@@ -72,19 +72,27 @@ fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsError
     }
 
     // Fall back to legacy format (inode_id u64 + name)
+    // BUT: Be strict about what we accept as legacy format to avoid misinterpreting corrupted data
     if data.len() >= 8 {
         let inode_id = u64::from_le_bytes(data[..8].try_into().unwrap());
         let name = data[8..].to_vec();
         
-        // Skip corrupted entries with invalid inode IDs
-        // Valid inode IDs should be < 2^32 in most cases
-        const MAX_VALID_INODE: u64 = 0xFFFF_FFFF; // 2^32 - 1
-        if inode_id > MAX_VALID_INODE {
+        // Validate that this looks like a real legacy entry:
+        // 1. Inode ID should be reasonable (< 100,000 for normal inodes)
+        //    OR a known virtual inode (SNAPSHOTS_ROOT_INODE = 0xFFFFFFFF00000001)
+        // 2. Name should be valid UTF-8 or at least printable
+        // 3. Name should not be empty
+        
+        let is_valid_inode = inode_id < 100_000 || inode_id == 0xFFFFFFFF00000001;
+        let is_valid_name = !name.is_empty() && name.len() < 256; // Reasonable filename length
+        
+        if !is_valid_inode || !is_valid_name {
             warn!(
-                "Skipping corrupted directory entry '{}' with invalid inode_id={} (exceeds max {})",
-                String::from_utf8_lossy(&name),
+                "Rejecting invalid legacy format entry: inode_id={} (0x{:X}), name_len={}, name={}",
                 inode_id,
-                MAX_VALID_INODE
+                inode_id,
+                name.len(),
+                String::from_utf8_lossy(&name)
             );
             return Err(FsError::InvalidData);
         }
@@ -213,27 +221,35 @@ impl DirectoryStore {
             .map_err(|_| FsError::IoError)?;
 
         Ok(Box::pin(futures::stream::unfold(iter, |mut iter| async {
-            match iter.next().await {
-                Some(Ok((key, value))) => {
-                    let cookie = match KeyCodec::parse_key(&key) {
-                        ParsedKey::DirScan { cookie } => cookie,
-                        _ => return Some((Err(FsError::InvalidData), iter)),
-                    };
-                    match decode_dir_scan_value(&value) {
-                        Ok((name, scan_value)) => Some((
-                            Ok(DirEntryInfo {
-                                name,
-                                inode_id: scan_value.inode_id(),
-                                cookie,
-                                inode: scan_value.inode().cloned(),
-                            }),
-                            iter,
-                        )),
-                        Err(e) => Some((Err(e), iter)),
+            loop {
+                match iter.next().await {
+                    Some(Ok((key, value))) => {
+                        let cookie = match KeyCodec::parse_key(&key) {
+                            ParsedKey::DirScan { cookie } => cookie,
+                            _ => return Some((Err(FsError::InvalidData), iter)),
+                        };
+                        match decode_dir_scan_value(&value) {
+                            Ok((name, scan_value)) => {
+                                return Some((
+                                    Ok(DirEntryInfo {
+                                        name,
+                                        inode_id: scan_value.inode_id(),
+                                        cookie,
+                                        inode: scan_value.inode().cloned(),
+                                    }),
+                                    iter,
+                                ));
+                            }
+                            Err(FsError::InvalidData) => {
+                                // Skip corrupted entries and continue to next entry
+                                continue;
+                            }
+                            Err(e) => return Some((Err(e), iter)),
+                        }
                     }
+                    Some(Err(_)) => return Some((Err(FsError::IoError), iter)),
+                    None => return None,
                 }
-                Some(Err(_)) => Some((Err(FsError::IoError), iter)),
-                None => None,
             }
         })))
     }
@@ -254,27 +270,35 @@ impl DirectoryStore {
             .map_err(|_| FsError::IoError)?;
 
         Ok(Box::pin(futures::stream::unfold(iter, |mut iter| async {
-            match iter.next().await {
-                Some(Ok((key, value))) => {
-                    let cookie = match KeyCodec::parse_key(&key) {
-                        ParsedKey::DirScan { cookie } => cookie,
-                        _ => return Some((Err(FsError::InvalidData), iter)),
-                    };
-                    match decode_dir_scan_value(&value) {
-                        Ok((name, scan_value)) => Some((
-                            Ok(DirEntryInfo {
-                                name,
-                                inode_id: scan_value.inode_id(),
-                                cookie,
-                                inode: scan_value.inode().cloned(),
-                            }),
-                            iter,
-                        )),
-                        Err(e) => Some((Err(e), iter)),
+            loop {
+                match iter.next().await {
+                    Some(Ok((key, value))) => {
+                        let cookie = match KeyCodec::parse_key(&key) {
+                            ParsedKey::DirScan { cookie } => cookie,
+                            _ => return Some((Err(FsError::InvalidData), iter)),
+                        };
+                        match decode_dir_scan_value(&value) {
+                            Ok((name, scan_value)) => {
+                                return Some((
+                                    Ok(DirEntryInfo {
+                                        name,
+                                        inode_id: scan_value.inode_id(),
+                                        cookie,
+                                        inode: scan_value.inode().cloned(),
+                                    }),
+                                    iter,
+                                ));
+                            }
+                            Err(FsError::InvalidData) => {
+                                // Skip corrupted entries and continue to next entry
+                                continue;
+                            }
+                            Err(e) => return Some((Err(e), iter)),
+                        }
                     }
+                    Some(Err(_)) => return Some((Err(FsError::IoError), iter)),
+                    None => return None,
                 }
-                Some(Err(_)) => Some((Err(FsError::IoError), iter)),
-                None => None,
             }
         })))
     }

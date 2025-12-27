@@ -255,6 +255,13 @@ async fn main() -> Result<()> {
                 cli::dataset::restore_from_snapshot(&config, &snapshot, &source, &destination)
                     .await?;
             }
+            cli::DatasetCommands::Clone {
+                config,
+                source,
+                destination,
+            } => {
+                cli::dataset::clone_path(&config, &source, &destination).await?;
+            }
         },
         cli::Commands::Fatrace { config } => {
             cli::fatrace::run_fatrace(config).await?;

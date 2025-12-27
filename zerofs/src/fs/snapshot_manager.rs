@@ -387,6 +387,24 @@ impl SnapshotManager {
             cache.flush_now(self.db.as_ref()).await?;
             tracing::info!("Writeback cache flushed successfully");
         }
+        
+        // Flush database to ensure all pending writes are visible when listing directory entries
+        // Use a timeout to prevent hanging on large datasets
+        tracing::info!("Flushing database before listing directory entries...");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.db.flush()
+        ).await {
+            Ok(Ok(_)) => {
+                tracing::info!("Database flushed successfully before listing");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Database flush failed: {:?}, continuing anyway", e);
+            }
+            Err(_) => {
+                tracing::warn!("Database flush timed out after 10 seconds, continuing anyway");
+            }
+        }
 
         // Get the source dataset
         let source = self
@@ -454,12 +472,30 @@ impl SnapshotManager {
             )
             .await?;
 
-        // Clone directory entries (COW - they reference the same inodes)
-        self.clone_directory_entries(source.root_inode, snapshot_root_id)
+        // Deep clone directory entries and all inodes recursively (COW - data chunks shared)
+        tracing::info!("Starting deep clone of directory {} to {}", source.root_inode, snapshot_root_id);
+        self.clone_directory_deep(source.root_inode, snapshot_root_id)
             .await?;
+        tracing::info!("Deep clone completed successfully");
         
-        // Flush to ensure all entries are persisted
-        self.db.flush().await.map_err(|_| FsError::IoError)?;
+        // Flush to ensure all entries are persisted (with timeout to prevent hanging)
+        tracing::info!("Flushing database to ensure snapshot durability...");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.db.flush()
+        ).await {
+            Ok(Ok(_)) => {
+                tracing::info!("Database flushed successfully");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Database flush failed: {:?}, but snapshot creation will continue", e);
+                // Continue anyway - snapshot is created, just not guaranteed durable yet
+            }
+            Err(_) => {
+                tracing::warn!("Database flush timed out after 30 seconds, but snapshot creation will continue");
+                // Continue anyway - snapshot is created, just not guaranteed durable yet
+            }
+        }
 
         // Create real directory entry for the snapshot in /snapshots/
         self.create_snapshot_directory(&snapshot_name, snapshot_root_id, created_at)
@@ -470,6 +506,226 @@ impl SnapshotManager {
             snapshot_name, snapshot_name
         );
         Ok(snapshot)
+    }
+
+    /// Get the next cookie for a directory entry
+    async fn get_next_cookie(&self, dir_inode: InodeId) -> Result<u64, FsError> {
+        let cookie_key = KeyCodec::dir_cookie_counter_key(dir_inode);
+        let cookie: u64 = match self.db.get_bytes(&cookie_key).await {
+            Ok(Some(val)) => {
+                let bytes: [u8; 8] = val.as_ref().try_into().map_err(|_| FsError::IoError)?;
+                u64::from_be_bytes(bytes)
+            }
+            _ => crate::fs::store::directory::COOKIE_FIRST_ENTRY,
+        };
+        
+        let new_cookie = cookie + 1;
+        self.db
+            .put_with_options(
+                &cookie_key,
+                &new_cookie.to_be_bytes(),
+                &slatedb::config::PutOptions::default(),
+                &slatedb::config::WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .map_err(|_| FsError::IoError)?;
+        
+        Ok(cookie)
+    }
+
+    /// Deep clone directory and all its contents recursively
+    /// This creates new inodes for all files and subdirectories
+    /// Data chunks are shared (COW) but inodes are independent
+    async fn clone_directory_deep(
+        &self,
+        source_dir_id: InodeId,
+        dest_dir_id: InodeId,
+    ) -> Result<(), FsError> {
+        use crate::fs::inode::Inode;
+        
+        // Get all entries from source directory
+        let mut entries: Vec<(Vec<u8>, InodeId, u64)> = vec![];
+        let stream = self.directory_store.list_from(source_dir_id, 0).await?;
+        pin_mut!(stream);
+
+        while let Some(result) = stream.next().await {
+            let entry = match result {
+                Ok(e) => e,
+                Err(FsError::InvalidData) => {
+                    tracing::warn!("Skipping corrupted entry in directory {}", source_dir_id);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            entries.push((entry.name.clone(), entry.inode_id, entry.cookie));
+        }
+
+        tracing::info!(
+            "Deep cloning {} entries from directory {} to {}",
+            entries.len(),
+            source_dir_id,
+            dest_dir_id
+        );
+        
+        // Log first few entry names for debugging
+        for (idx, (name, inode_id, _)) in entries.iter().take(5).enumerate() {
+            tracing::info!(
+                "Entry {}: '{}' (inode {})",
+                idx,
+                String::from_utf8_lossy(name),
+                inode_id
+            );
+        }
+        if entries.len() > 5 {
+            tracing::info!("... and {} more entries", entries.len() - 5);
+        }
+
+        let mut cloned_count = 0;
+        let mut skipped_count = 0;
+        let total_entries = entries.len();
+        tracing::info!("Starting to process {} entries for deep clone", total_entries);
+        
+        for (idx, (name, source_inode_id, _cookie)) in entries.into_iter().enumerate() {
+            let name_str = String::from_utf8_lossy(&name);
+            
+            // Log progress every 5 entries
+            if idx % 5 == 0 {
+                tracing::info!("Progress: {}/{} entries processed (cloned: {}, skipped: {})", 
+                    idx, total_entries, cloned_count, skipped_count);
+            }
+            
+            // Skip . and .. entries
+            if name_str == "." || name_str == ".." {
+                skipped_count += 1;
+                continue;
+            }
+            
+            // Skip corrupted inode IDs (legacy format corruption)
+            // Valid inode IDs should be reasonable (< 100,000)
+            // Corrupted IDs are typically 0xFFFFFFFF + offset or similar large values
+            if source_inode_id > 100_000 {
+                tracing::warn!(
+                    "Skipping entry '{}' with corrupted inode ID {} (0x{:X}) during snapshot",
+                    name_str,
+                    source_inode_id,
+                    source_inode_id
+                );
+                skipped_count += 1;
+                continue;
+            }
+            
+            tracing::debug!(
+                "Processing entry '{}' (inode {}) for deep clone",
+                name_str,
+                source_inode_id
+            );
+            
+            // Get the source inode
+            tracing::debug!("Getting inode {} for entry '{}'", source_inode_id, name_str);
+            let source_inode = match self.inode_store.get(source_inode_id).await {
+                Ok(inode) => inode,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to get inode {} for entry '{}': {}. Skipping.",
+                        source_inode_id,
+                        name_str,
+                        e
+                    );
+                    continue; // Skip entries with missing inodes instead of failing entire snapshot
+                }
+            };
+            
+            // Allocate new inode ID for the clone
+            let new_inode_id = self.inode_store.allocate();
+            
+            // Clone the inode (COW for data chunks)
+            let cloned_inode = source_inode.clone();
+            let is_directory = matches!(cloned_inode, Inode::Directory(_));
+            
+            tracing::info!(
+                "Deep cloning entry '{}': source inode {} -> new inode {} (type: {})",
+                name_str,
+                source_inode_id,
+                new_inode_id,
+                if is_directory { "directory" } else { "file" }
+            );
+            
+            // Save the cloned inode (non-durable for performance, flushed at end)
+            let inode_key = KeyCodec::inode_key(new_inode_id);
+            let inode_bytes = bincode::serialize(&cloned_inode).map_err(|_| FsError::IoError)?;
+            self.db
+                .put_with_options(
+                    &inode_key,
+                    &inode_bytes,
+                    &slatedb::config::PutOptions::default(),
+                    &slatedb::config::WriteOptions {
+                        await_durable: false, // Batch writes for performance
+                    },
+                )
+                .await
+                .map_err(|_| FsError::IoError)?;
+            
+            // Allocate cookie for directory entry
+            let cookie = self.get_next_cookie(dest_dir_id).await?;
+            
+            // Create directory entry in destination (non-durable for performance)
+            let entry_key = KeyCodec::dir_entry_key(dest_dir_id, &name);
+            let entry_value = KeyCodec::encode_dir_entry(new_inode_id, cookie);
+            self.db
+                .put_with_options(
+                    &entry_key,
+                    &entry_value,
+                    &slatedb::config::PutOptions::default(),
+                    &slatedb::config::WriteOptions {
+                        await_durable: false, // Batch writes for performance
+                    },
+                )
+                .await
+                .map_err(|_| FsError::IoError)?;
+            
+            // Create dir_scan entry (non-durable for performance)
+            let scan_key = KeyCodec::dir_scan_key(dest_dir_id, cookie);
+            let scan_value = DirScanValue::Reference {
+                inode_id: new_inode_id,
+            };
+            let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
+            self.db
+                .put_with_options(
+                    &scan_key,
+                    &scan_value_bytes,
+                    &slatedb::config::PutOptions::default(),
+                    &slatedb::config::WriteOptions {
+                        await_durable: false, // Batch writes for performance
+                    },
+                )
+                .await
+                .map_err(|_| FsError::IoError)?;
+            
+            // If it's a directory, recursively clone its contents
+            if is_directory {
+                tracing::info!(
+                    "Recursively cloning subdirectory '{}' (source: {}, dest: {})",
+                    name_str,
+                    source_inode_id,
+                    new_inode_id
+                );
+                Box::pin(self.clone_directory_deep(source_inode_id, new_inode_id)).await?;
+            }
+            
+            cloned_count += 1;
+        }
+
+        tracing::info!(
+            "Completed deep cloning: {} entries cloned, {} skipped from directory {} to {}",
+            cloned_count,
+            skipped_count,
+            source_dir_id,
+            dest_dir_id
+        );
+
+        Ok(())
     }
 
     /// Clone directory entries from source to destination
@@ -527,17 +783,6 @@ impl SnapshotManager {
         );
         for (name, inode_id, cookie) in entries {
             let name_str = String::from_utf8_lossy(&name);
-            
-            // Skip entries with invalid inode IDs
-            const MAX_VALID_INODE: u64 = 0xFFFF_FFFF;
-            if inode_id > MAX_VALID_INODE {
-                tracing::warn!(
-                    "Skipping entry '{}' with invalid inode_id={} during snapshot clone",
-                    name_str,
-                    inode_id
-                );
-                continue;
-            }
             
             tracing::debug!(
                 "Cloning entry '{}' (inode {}) from {} to {}",

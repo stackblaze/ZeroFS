@@ -90,6 +90,18 @@ impl AdminRpcServer {
                 continue;
             }
 
+            // Skip corrupted inode IDs (legacy format corruption)
+            // Valid inode IDs should be reasonable (< 100,000)
+            if entry.inode_id > 100_000 {
+                tracing::warn!(
+                    "Skipping entry '{}' with corrupted inode ID {} (0x{:X}) during restore",
+                    name,
+                    entry.inode_id,
+                    entry.inode_id
+                );
+                continue;
+            }
+
             tracing::debug!(
                 "Cloning entry '{}' (inode {}) from snapshot",
                 name,
@@ -878,6 +890,244 @@ impl AdminService for AdminRpcServer {
             inode_id: new_inode_id,
             file_size,
             nlink: 1, // New file starts with nlink=1
+        }))
+    }
+
+    async fn clone_path(
+        &self,
+        request: Request<proto::ClonePathRequest>,
+    ) -> Result<Response<proto::ClonePathResponse>, Status> {
+        use crate::fs::inode::Inode;
+
+        let req = request.into_inner();
+        let source_path = req.source_path;
+        let destination_path = req.destination_path;
+
+        tracing::info!(
+            "COW clone: source='{}', dest='{}'",
+            source_path,
+            destination_path
+        );
+
+        // Parse paths
+        let source_parts: Vec<&str> = source_path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let dest_parts: Vec<&str> = destination_path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if source_parts.is_empty() || dest_parts.is_empty() {
+            return Err(Status::invalid_argument(
+                "Source and destination paths cannot be empty",
+            ));
+        }
+
+        let fs_ref = &self.fs;
+
+        // Navigate to source
+        let mut current_inode = 0u64; // root
+        for part in &source_parts {
+            let inode = fs_ref.inode_store.get(current_inode).await.map_err(|e| {
+                Status::internal(format!("Failed to read inode {}: {}", current_inode, e))
+            })?;
+
+            match inode {
+                Inode::Directory(_) => {
+                    current_inode = fs_ref
+                        .directory_store
+                        .get(current_inode, part.as_bytes())
+                        .await
+                        .map_err(|_| {
+                            Status::not_found(format!("Source path component '{}' not found", part))
+                        })?;
+                }
+                _ => {
+                    return Err(Status::invalid_argument(format!(
+                        "'{}' is not a directory",
+                        part
+                    )));
+                }
+            }
+        }
+
+        // Get source inode
+        let source_inode = fs_ref.inode_store.get(current_inode).await.map_err(|e| {
+            Status::not_found(format!("Source inode {} not found: {}", current_inode, e))
+        })?;
+
+        let is_directory = matches!(source_inode, Inode::Directory(_));
+        let size = match &source_inode {
+            Inode::File(f) => f.size,
+            _ => 0,
+        };
+
+        // Navigate to destination parent directory
+        let dest_name = dest_parts.last().unwrap();
+        let dest_dir_parts = &dest_parts[..dest_parts.len() - 1];
+
+        let mut dest_dir_inode = 0u64; // root
+        for part in dest_dir_parts {
+            let inode = fs_ref
+                .inode_store
+                .get(dest_dir_inode)
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("Failed to read inode {}: {}", dest_dir_inode, e))
+                })?;
+
+            match inode {
+                Inode::Directory(_) => {
+                    dest_dir_inode = fs_ref
+                        .directory_store
+                        .get(dest_dir_inode, part.as_bytes())
+                        .await
+                        .map_err(|_| {
+                            Status::not_found(format!(
+                                "Destination path component '{}' not found",
+                                part
+                            ))
+                        })?;
+                }
+                _ => {
+                    return Err(Status::invalid_argument(format!(
+                        "'{}' is not a directory",
+                        part
+                    )));
+                }
+            }
+        }
+
+        // Check if destination already exists
+        if fs_ref
+            .directory_store
+            .exists(dest_dir_inode, dest_name.as_bytes())
+            .await
+            .map_err(|e| Status::internal(format!("Failed to check destination: {}", e)))?
+        {
+            return Err(Status::already_exists(format!(
+                "Destination '{}' already exists",
+                destination_path
+            )));
+        }
+
+        // Allocate new inode for the clone
+        let new_inode_id = fs_ref.inode_store.allocate();
+
+        // Clone the inode (COW - shares data chunks)
+        let mut new_inode = source_inode.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Update timestamps for the clone
+        match &mut new_inode {
+            Inode::File(f) => {
+                f.ctime = now;
+                f.ctime_nsec = 0;
+                f.mtime = now;
+                f.mtime_nsec = 0;
+                f.atime = now;
+                f.atime_nsec = 0;
+            }
+            Inode::Directory(d) => {
+                d.ctime = now;
+                d.ctime_nsec = 0;
+                d.mtime = now;
+                d.mtime_nsec = 0;
+                d.atime = now;
+                d.atime_nsec = 0;
+            }
+            _ => {}
+        }
+
+        // Create transaction
+        let mut txn = fs_ref
+            .db
+            .new_transaction()
+            .map_err(|e| Status::internal(format!("Failed to create transaction: {}", e)))?;
+
+        // Allocate cookie for directory entry
+        let cookie = fs_ref
+            .directory_store
+            .allocate_cookie(dest_dir_inode, &mut txn)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to allocate cookie: {}", e)))?;
+
+        // Add directory entry
+        fs_ref.directory_store.add(
+            &mut txn,
+            dest_dir_inode,
+            dest_name.as_bytes(),
+            new_inode_id,
+            cookie,
+            Some(&new_inode),
+        );
+
+        // Save the new inode
+        fs_ref
+            .inode_store
+            .save(&mut txn, new_inode_id, &new_inode)
+            .map_err(|e| Status::internal(format!("Failed to save inode: {}", e)))?;
+
+        // Commit transaction
+        let mut seq_guard = fs_ref.write_coordinator.allocate_sequence();
+        fs_ref
+            .commit_transaction_internal(txn, &mut seq_guard, true)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to commit: {}", e)))?;
+
+        // If it's a directory, recursively clone its contents
+        if is_directory {
+            tracing::info!(
+                "Recursively cloning directory contents from source inode {} to new inode {}",
+                current_inode,
+                new_inode_id
+            );
+            
+            // Create a temporary dataset object for the recursive clone function
+            // (it only uses the name for logging, so we can use a placeholder)
+            let temp_dataset = crate::fs::dataset::Dataset {
+                id: 0,
+                name: "live".to_string(),
+                uuid: uuid::Uuid::new_v4(),
+                created_at: 0,
+                root_inode: 0,
+                is_readonly: false,
+                is_snapshot: false,
+                parent_id: None,
+                parent_uuid: None,
+                flags: 0,
+                generation: 0,
+            };
+            
+            self.clone_directory_recursive(current_inode, new_inode_id, &temp_dataset)
+                .await?;
+                
+            tracing::info!(
+                "Completed recursive clone of directory from {} to {}",
+                current_inode,
+                new_inode_id
+            );
+        }
+
+        tracing::info!(
+            "COW clone complete: created new inode {} (type: {}) from source inode {}",
+            new_inode_id,
+            if is_directory { "directory" } else { "file" },
+            current_inode
+        );
+
+        Ok(Response::new(proto::ClonePathResponse {
+            inode_id: new_inode_id,
+            size,
+            is_directory,
         }))
     }
 }

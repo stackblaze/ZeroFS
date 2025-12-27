@@ -40,6 +40,9 @@ service AdminService {
     
     // Instant restore (COW - creates directory entry pointing to snapshot inode)
     rpc InstantRestoreFile(InstantRestoreFileRequest) returns (InstantRestoreFileResponse);
+    
+    // Clone a file or directory using COW (Copy-on-Write)
+    rpc ClonePath(ClonePathRequest) returns (ClonePathResponse);
 }
 
 message CheckpointInfo {
@@ -212,4 +215,15 @@ message InstantRestoreFileResponse {
     uint64 inode_id = 1;         // Inode ID of restored file (same as snapshot file)
     uint64 file_size = 2;        // File size
     uint32 nlink = 3;            // Link count (should be 2+ after restore)
+}
+
+message ClonePathRequest {
+    string source_path = 1;      // Source path within ZeroFS (e.g., /mydir)
+    string destination_path = 2; // Destination path within ZeroFS (e.g., /mydir-copy)
+}
+
+message ClonePathResponse {
+    uint64 inode_id = 1;         // Inode ID of cloned file/directory
+    uint64 size = 2;             // Size (for files) or 0 (for directories)
+    bool is_directory = 3;       // True if cloned item is a directory
 }

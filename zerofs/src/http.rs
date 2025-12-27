@@ -489,6 +489,55 @@ async fn restore_from_snapshot(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct CloneRequest {
+    source: String,
+    destination: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CloneResponse {
+    inode_id: u64,
+    size: u64,
+    is_directory: bool,
+    message: String,
+}
+
+async fn clone_path(
+    State(state): State<AppState>,
+    Json(req): Json<CloneRequest>,
+) -> Result<(StatusCode, Json<CloneResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let mut client = get_rpc_client(&state).await?;
+
+    let (inode_id, size, is_directory) = client
+        .clone_path(&req.source, &req.destination)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "CLONE_FAILED".to_string(),
+                    message: e.to_string(),
+                }),
+            )
+        })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(CloneResponse {
+            inode_id,
+            size,
+            is_directory,
+            message: format!(
+                "{} cloned successfully using COW. Inode: {}, Size: {} bytes. Data shared until modified.",
+                if is_directory { "Directory" } else { "File" },
+                inode_id,
+                size
+            ),
+        }),
+    ))
+}
+
 pub fn create_router(rpc_config: crate::config::RpcConfig) -> Router {
     let state = AppState { rpc_config };
 
@@ -503,6 +552,7 @@ pub fn create_router(rpc_config: crate::config::RpcConfig) -> Router {
         .route("/api/v1/snapshots/{name}", get(get_snapshot))
         .route("/api/v1/snapshots/{name}", delete(delete_snapshot))
         .route("/api/v1/snapshots/restore", post(restore_from_snapshot))
+        .route("/api/v1/clone", post(clone_path))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

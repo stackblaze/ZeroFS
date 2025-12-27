@@ -358,3 +358,48 @@ pub async fn restore_from_snapshot(
 
     Ok(())
 }
+
+/// Clone a file or directory using COW (Copy-on-Write)
+/// This creates an instant copy with no data duplication until modified
+pub async fn clone_path(
+    config_path: &Path,
+    source_path: &str,
+    destination_path: &str,
+) -> Result<()> {
+    use std::io::Write;
+
+    let mut client = connect_rpc_client(config_path).await?;
+
+    println!("🔄 Cloning with COW (Copy-on-Write)");
+    println!("   Source: {}", source_path);
+    println!("   Destination: {}", destination_path);
+    println!();
+
+    print!("⏳ Creating COW clone...");
+    std::io::stdout().flush()?;
+
+    let (inode_id, size, is_dir) = client
+        .clone_path(source_path, destination_path)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to clone '{}' to '{}'",
+                source_path, destination_path
+            )
+        })?;
+
+    println!(" done!");
+    println!();
+    println!("✅ Clone created successfully!");
+    println!("   Type: {}", if is_dir { "Directory" } else { "File" });
+    println!("   Inode: {}", inode_id);
+    if !is_dir {
+        println!("   Size: {}", format_size(size));
+    }
+    println!("   ⚡ COW: Data shared until modified (zero copy)");
+    println!();
+    println!("Note: Source and destination are now independent.");
+    println!("      Modifications to either won't affect the other.");
+
+    Ok(())
+}

@@ -389,4 +389,27 @@ impl RpcClient {
         self.create_snapshot_with_options(source_name, snapshot_name, false)
             .await
     }
+
+    /// Clone a file or directory using COW (Copy-on-Write)
+    /// Returns (inode_id, size, is_directory)
+    pub async fn clone_path(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+    ) -> Result<(u64, u64, bool)> {
+        let request = proto::ClonePathRequest {
+            source_path: source_path.to_string(),
+            destination_path: destination_path.to_string(),
+        };
+
+        let response = self
+            .client
+            .clone()
+            .clone_path(request)
+            .await
+            .map_err(|s| anyhow!("Failed to clone path: {}", s.message()))?
+            .into_inner();
+
+        Ok((response.inode_id, response.size, response.is_directory))
+    }
 }
