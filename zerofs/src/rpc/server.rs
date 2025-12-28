@@ -1,7 +1,6 @@
 use crate::checkpoint_manager::CheckpointManager;
 use crate::fs::ZeroFS;
-use crate::fs::errors::FsError;
-use crate::fs::snapshot_manager::SnapshotManager;
+use crate::fs::clone;
 use crate::fs::tracing::AccessTracer;
 use crate::rpc::proto::{self, admin_service_server::AdminService};
 use anyhow::{Context, Result};
@@ -19,7 +18,6 @@ use tracing::info;
 #[derive(Clone)]
 pub struct AdminRpcServer {
     checkpoint_manager: Arc<CheckpointManager>,
-    snapshot_manager: Arc<SnapshotManager>,
     tracer: AccessTracer,
     fs: Arc<ZeroFS>,
 }
@@ -27,149 +25,33 @@ pub struct AdminRpcServer {
 impl AdminRpcServer {
     pub fn new(
         checkpoint_manager: Arc<CheckpointManager>,
-        snapshot_manager: Arc<SnapshotManager>,
         tracer: AccessTracer,
         fs: Arc<ZeroFS>,
     ) -> Self {
         Self {
             checkpoint_manager,
-            snapshot_manager,
             tracer,
             fs,
         }
     }
 
-    /// Recursively clone directory contents from snapshot to live filesystem
+    /// Recursively clone directory contents
     /// This performs true COW - all inodes and data chunks are shared until modified
     async fn clone_directory_recursive(
         &self,
         source_dir_inode: u64,
         dest_dir_inode: u64,
-        snapshot: &crate::fs::dataset::Dataset,
     ) -> Result<(), Status> {
-        use tokio_stream::StreamExt;
-
-        tracing::info!(
-            "Cloning directory contents from snapshot '{}': source_inode={}, dest_inode={}",
-            snapshot.name,
+        clone::clone_directory_deep(
+            self.fs.db.clone(),
+            &self.fs.inode_store,
+            &self.fs.directory_store,
+            &self.fs.chunk_store,
             source_dir_inode,
-            dest_dir_inode
-        );
-
-        // List all entries in the source directory from the snapshot
-        let mut stream = self.fs.directory_store.list_from(source_dir_inode, 0).await
-            .map_err(|e| Status::internal(format!("Failed to list directory: {}", e)))?;
-
-        let mut entries = Vec::new();
-        while let Some(result) = stream.next().await {
-            // Skip corrupted entries (InvalidData errors)
-            let entry = match result {
-                Ok(e) => e,
-                Err(e) if matches!(e, FsError::InvalidData) => {
-                    tracing::warn!("Skipping corrupted entry in directory {}", source_dir_inode);
-                    continue;
-                }
-                Err(e) => return Err(Status::internal(format!("Failed to read entry: {}", e))),
-            };
-            entries.push(entry);
-        }
-
-        let num_entries = entries.len();
-        tracing::info!(
-            "Found {} entries in source directory {}",
-            num_entries,
-            source_dir_inode
-        );
-
-        // Clone each entry
-        for entry in entries {
-            let name = String::from_utf8_lossy(&entry.name).to_string();
-            
-            // Skip . and .. entries
-            if name == "." || name == ".." {
-                continue;
-            }
-
-            // Note: Inode ID validation is now centralized in directory.rs::decode_dir_scan_value()
-            // Corrupted entries are rejected at read time and never reach this code
-
-            tracing::debug!(
-                "Cloning entry '{}' (inode {}) from snapshot",
-                name,
-                entry.inode_id
-            );
-
-            // Get the inode from the snapshot
-            let source_inode = self.fs.inode_store.get(entry.inode_id).await
-                .map_err(|e| Status::internal(format!("Failed to get inode {}: {}", entry.inode_id, e)))?;
-            
-            // Allocate a new inode ID in the live filesystem
-            let new_inode_id = self.fs.inode_store.allocate();
-            
-            // Clone the inode metadata
-            let new_inode = source_inode.clone();
-            let is_directory = matches!(new_inode, crate::fs::inode::Inode::Directory(_));
-            
-            // Create transaction
-            let mut txn = self.fs.db.new_transaction()
-                .map_err(|e| Status::internal(format!("Failed to create transaction: {}", e)))?;
-            
-            // Allocate cookie for directory entry
-            let cookie = self.fs
-                .directory_store
-                .allocate_cookie(dest_dir_inode, &mut txn)
-                .await
-                .map_err(|e| Status::internal(format!("Failed to allocate cookie: {}", e)))?;
-            
-            // Add directory entry
-            self.fs.directory_store.add(
-                &mut txn,
-                dest_dir_inode,
-                entry.name.as_slice(),
-                new_inode_id,
-                cookie,
-                Some(&new_inode),
-            );
-            
-            // Save the new inode
-            self.fs
-                .inode_store
-                .save(&mut txn, new_inode_id, &new_inode)
-                .map_err(|e| Status::internal(format!("Failed to save inode: {}", e)))?;
-            
-            // Commit transaction
-            let mut seq_guard = self.fs.write_coordinator.allocate_sequence();
-            self.fs
-                .commit_transaction_internal(txn, &mut seq_guard, true)
-                .await
-                .map_err(|e| Status::internal(format!("Failed to commit: {}", e)))?;
-
-            tracing::debug!(
-                "Cloned '{}': snapshot inode {} -> new inode {}",
-                name,
-                entry.inode_id,
-                new_inode_id
-            );
-
-            // If this is a directory, recursively clone its contents
-            if is_directory {
-                tracing::info!(
-                    "Recursively cloning subdirectory '{}' (snapshot inode {} -> new inode {})",
-                    name,
-                    entry.inode_id,
-                    new_inode_id
-                );
-                Box::pin(self.clone_directory_recursive(entry.inode_id, new_inode_id, snapshot))
-                    .await?;
-            }
-        }
-
-        tracing::info!(
-            "Completed cloning {} entries from directory {} to {}",
-            num_entries,
-            source_dir_inode,
-            dest_dir_inode
-        );
+            dest_dir_inode,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("Failed to clone directory: {}", e)))?;
 
         Ok(())
     }
@@ -264,150 +146,65 @@ impl AdminService for AdminRpcServer {
 
     async fn create_dataset(
         &self,
-        request: Request<proto::CreateDatasetRequest>,
+        _request: Request<proto::CreateDatasetRequest>,
     ) -> Result<Response<proto::CreateDatasetResponse>, Status> {
-        let name = request.into_inner().name;
-
-        // Allocate a new inode for the dataset root
-        let root_inode = self.snapshot_manager.allocate_inode();
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let dataset = self
-            .snapshot_manager
-            .create_dataset(name, root_inode, created_at, false)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to create dataset: {}", e)))?;
-
-        Ok(Response::new(proto::CreateDatasetResponse {
-            dataset: Some(dataset.into()),
-        }))
+        return Err(Status::unimplemented("Dataset management not implemented. Use clone command instead."));
     }
 
     async fn list_datasets(
         &self,
         _request: Request<proto::ListDatasetsRequest>,
     ) -> Result<Response<proto::ListDatasetsResponse>, Status> {
-        let datasets = self.snapshot_manager.list_datasets().await;
-
-        Ok(Response::new(proto::ListDatasetsResponse {
-            datasets: datasets.into_iter().map(|s| s.into()).collect(),
-        }))
+        return Err(Status::unimplemented("Dataset management not needed for clone-only"));
     }
 
     async fn delete_dataset(
         &self,
-        request: Request<proto::DeleteDatasetRequest>,
+        _request: Request<proto::DeleteDatasetRequest>,
     ) -> Result<Response<proto::DeleteDatasetResponse>, Status> {
-        let name = request.into_inner().name;
-
-        self.snapshot_manager
-            .delete_dataset(&name)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to delete dataset: {}", e)))?;
-
-        Ok(Response::new(proto::DeleteDatasetResponse {}))
+        return Err(Status::unimplemented("Dataset management not needed for clone-only"));
     }
 
     async fn get_dataset_info(
         &self,
-        request: Request<proto::GetDatasetInfoRequest>,
+        _request: Request<proto::GetDatasetInfoRequest>,
     ) -> Result<Response<proto::GetDatasetInfoResponse>, Status> {
-        let name = request.into_inner().name;
-
-        let dataset = self
-            .snapshot_manager
-            .get_dataset_by_name(&name)
-            .await
-            .ok_or_else(|| Status::not_found(format!("Dataset '{}' not found", name)))?;
-
-        Ok(Response::new(proto::GetDatasetInfoResponse {
-            dataset: Some(dataset.into()),
-        }))
+        return Err(Status::unimplemented("Dataset management not needed for clone-only"));
     }
 
     async fn set_default_dataset(
         &self,
-        request: Request<proto::SetDefaultDatasetRequest>,
+        _request: Request<proto::SetDefaultDatasetRequest>,
     ) -> Result<Response<proto::SetDefaultDatasetResponse>, Status> {
-        let name = request.into_inner().name;
-
-        self.snapshot_manager
-            .set_default_dataset(&name)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to set default dataset: {}", e)))?;
-
-        Ok(Response::new(proto::SetDefaultDatasetResponse {}))
+        return Err(Status::unimplemented("Dataset management not needed for clone-only"));
     }
 
     async fn get_default_dataset(
         &self,
         _request: Request<proto::GetDefaultDatasetRequest>,
     ) -> Result<Response<proto::GetDefaultDatasetResponse>, Status> {
-        let dataset_id = self.snapshot_manager.get_default_dataset().await;
-
-        Ok(Response::new(proto::GetDefaultDatasetResponse {
-            dataset_id,
-        }))
+        return Err(Status::unimplemented("Dataset management not needed for clone-only"));
     }
 
     async fn create_snapshot(
         &self,
-        request: Request<proto::CreateSnapshotRequest>,
+        _request: Request<proto::CreateSnapshotRequest>,
     ) -> Result<Response<proto::CreateSnapshotResponse>, Status> {
-        let req = request.into_inner();
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        // Default to read-write snapshots (like btrfs)
-        let is_readonly = req.readonly.unwrap_or(false);
-
-        let snapshot = self
-            .snapshot_manager
-            .create_snapshot_by_name(&req.source_name, req.snapshot_name, created_at, is_readonly)
-            .await
-            .map_err(|e| {
-                let error_msg = match e {
-                    crate::fs::errors::FsError::NotFound => {
-                        format!("Dataset '{}' not found. Use ListDatasets RPC to see available datasets.", req.source_name)
-                    }
-                    _ => format!("Failed to create snapshot: {}", e),
-                };
-                Status::internal(error_msg)
-            })?;
-
-        Ok(Response::new(proto::CreateSnapshotResponse {
-            snapshot: Some(snapshot.into()),
-        }))
+        return Err(Status::unimplemented("Use clone command instead: zerofs dataset clone"));
     }
 
     async fn list_snapshots(
         &self,
         _request: Request<proto::ListSnapshotsRequest>,
     ) -> Result<Response<proto::ListSnapshotsResponse>, Status> {
-        let snapshots = self.snapshot_manager.list_snapshots().await;
-
-        Ok(Response::new(proto::ListSnapshotsResponse {
-            snapshots: snapshots.into_iter().map(|s| s.into()).collect(),
-        }))
+        return Err(Status::unimplemented("Clones are just directories - use ls /snapshots/"));
     }
 
     async fn delete_snapshot(
         &self,
-        request: Request<proto::DeleteSnapshotRequest>,
+        _request: Request<proto::DeleteSnapshotRequest>,
     ) -> Result<Response<proto::DeleteSnapshotResponse>, Status> {
-        let name = request.into_inner().name;
-
-        self.snapshot_manager
-            .delete_snapshot_by_name(&name)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to delete snapshot: {}", e)))?;
-
-        Ok(Response::new(proto::DeleteSnapshotResponse {}))
+        return Err(Status::unimplemented("Clones are just directories - delete with rm -rf"));
     }
 
     type ReadSnapshotFileStream =
@@ -415,473 +212,16 @@ impl AdminService for AdminRpcServer {
 
     async fn read_snapshot_file(
         &self,
-        request: Request<proto::ReadSnapshotFileRequest>,
+        _request: Request<proto::ReadSnapshotFileRequest>,
     ) -> Result<Response<Self::ReadSnapshotFileStream>, Status> {
-        use crate::fs::inode::Inode;
-        use tokio_stream::StreamExt;
-
-        let req = request.into_inner();
-        let snapshot_name = req.snapshot_name;
-        let file_path = req.file_path;
-
-        // Get snapshot info
-        let snapshot = self
-            .snapshot_manager
-            .get_dataset_by_name(&snapshot_name)
-            .await
-            .ok_or_else(|| Status::not_found(format!("Snapshot '{}' not found", snapshot_name)))?;
-
-        if !snapshot.is_snapshot {
-            return Err(Status::invalid_argument(format!(
-                "'{}' is not a snapshot",
-                snapshot_name
-            )));
-        }
-
-        // Parse the file path and navigate to the file inode
-        let snapshot_root = snapshot.root_inode;
-        let path_parts: Vec<&str> = file_path
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        tracing::info!(
-            "Reading file from snapshot '{}' root inode {}: {:?}",
-            snapshot_name,
-            snapshot_root,
-            path_parts
-        );
-
-        // Navigate through the directory tree to find the file
-        let mut current_inode = snapshot_root;
-        let fs_ref = self.fs.clone();
-
-        // Navigate to the file
-        for part in &path_parts {
-            let inode = fs_ref.inode_store.get(current_inode).await.map_err(|e| {
-                Status::internal(format!("Failed to read inode {}: {}", current_inode, e))
-            })?;
-
-            tracing::info!(
-                "Looking up '{}' in inode {} (type: {:?})",
-                part,
-                current_inode,
-                match &inode {
-                    Inode::Directory(_) => "Dir",
-                    Inode::File(_) => "File",
-                    _ => "Other",
-                }
-            );
-
-            match inode {
-                Inode::Directory(_) => {
-                    // Look up the next component in the directory
-                    tracing::info!(
-                        "Attempting directory_store.get(dir_id={}, name='{}')",
-                        current_inode,
-                        part
-                    );
-                    current_inode = fs_ref
-                        .directory_store
-                        .get(current_inode, part.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            tracing::error!(
-                                "Failed to find '{}' in directory {}: {}",
-                                part,
-                                current_inode,
-                                e
-                            );
-                            Status::not_found(format!("Path component '{}' not found: {}", part, e))
-                        })?;
-                    tracing::info!("Found '{}' -> inode {}", part, current_inode);
-                }
-                _ => {
-                    return Err(Status::invalid_argument(format!(
-                        "'{}' is not a directory",
-                        part
-                    )));
-                }
-            }
-        }
-
-        // Now current_inode should be the file inode
-        let file_inode = fs_ref
-            .inode_store
-            .get(current_inode)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to read file inode: {}", e)))?;
-
-        let total_size = match file_inode {
-            Inode::File(file) => file.size,
-            _ => {
-                return Err(Status::invalid_argument("Path does not point to a file"));
-            }
-        };
-
-        // Create a stream that reads the file in chunks
-        const CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4MB
-        let num_chunks = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
-        let file_id = current_inode;
-        let fs_clone = fs_ref.clone();
-
-        let stream = tokio_stream::iter(0..num_chunks).then(move |chunk_idx| {
-            let fs = fs_clone.clone();
-            let fid = file_id;
-            let ts = total_size;
-            async move {
-                let offset = chunk_idx * CHUNK_SIZE;
-                let read_size = std::cmp::min(CHUNK_SIZE, ts - offset);
-
-                // Use root auth context for snapshot reading
-                let auth = crate::fs::types::AuthContext {
-                    uid: 0,
-                    gid: 0,
-                    gids: vec![],
-                };
-
-                match fs.read_file(&auth, fid, offset, read_size as u32).await {
-                    Ok((data, _eof)) => Ok(proto::FileChunk {
-                        data: data.to_vec(),
-                        offset,
-                        total_size: ts,
-                    }),
-                    Err(e) => Err(Status::internal(format!(
-                        "Failed to read file chunk at offset {}: {}",
-                        offset, e
-                    ))),
-                }
-            }
-        });
-
-        Ok(Response::new(
-            Box::pin(stream) as Self::ReadSnapshotFileStream
-        ))
+        return Err(Status::unimplemented("Use clone command instead: zerofs dataset clone"));
     }
 
     async fn instant_restore_file(
         &self,
-        request: Request<proto::InstantRestoreFileRequest>,
+        _request: Request<proto::InstantRestoreFileRequest>,
     ) -> Result<Response<proto::InstantRestoreFileResponse>, Status> {
-        use crate::fs::inode::Inode;
-        use crate::fs::types::AuthContext;
-
-        let req = request.into_inner();
-        let snapshot_name = req.snapshot_name;
-        let source_path = req.source_path;
-        let destination_path = req.destination_path;
-
-        // CRITICAL: Flush writeback cache before instant restore to ensure consistency
-        // This ensures:
-        // 1. Recently deleted files are actually deleted in backend
-        // 2. Recently created files are visible in snapshots
-        // 3. directory_store.exists() sees accurate state
-        tracing::info!("Flushing writeback cache before instant restore...");
-        if let Some(ref cache) = self.fs.writeback_cache {
-            cache.flush_now(self.fs.db.as_ref()).await.map_err(|e| {
-                Status::internal(format!("Failed to flush writeback cache: {}", e))
-            })?;
-            tracing::info!("Writeback cache flushed successfully");
-        }
-
-        // Get snapshot info
-        let snapshot = self
-            .snapshot_manager
-            .get_dataset_by_name(&snapshot_name)
-            .await
-            .ok_or_else(|| Status::not_found(format!("Snapshot '{}' not found", snapshot_name)))?;
-
-        if !snapshot.is_snapshot {
-            return Err(Status::invalid_argument(format!(
-                "'{}' is not a snapshot",
-                snapshot_name
-            )));
-        }
-
-        // Navigate to source file in snapshot
-        let snapshot_root = snapshot.root_inode;
-        let source_parts: Vec<&str> = source_path
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if source_parts.is_empty() {
-            return Err(Status::invalid_argument("Source path cannot be empty"));
-        }
-
-        tracing::info!(
-            "Instant restore: snapshot '{}' root inode {}: source={:?}, dest={}",
-            snapshot_name,
-            snapshot_root,
-            source_parts,
-            destination_path
-        );
-
-        let mut current_inode = snapshot_root;
-        let fs_ref = self.fs.clone();
-
-        // Navigate through the ENTIRE path to find the source file/directory
-        // For files: /volumes/pvc-xxx/file.txt -> navigate through volumes, pvc-xxx, then get file.txt
-        // For directories: /volumes/pvc-xxx -> navigate through volumes, then get pvc-xxx
-        for (idx, part) in source_parts.iter().enumerate() {
-            let is_last = idx == source_parts.len() - 1;
-            
-            tracing::info!(
-                "Navigating: part '{}' ({}/{}) in inode {}",
-                part,
-                idx + 1,
-                source_parts.len(),
-                current_inode
-            );
-            
-            let inode = fs_ref.inode_store.get(current_inode).await.map_err(|e| {
-                Status::internal(format!("Failed to read inode {}: {}", current_inode, e))
-            })?;
-
-            match inode {
-                Inode::Directory(_) => {
-                    current_inode = fs_ref
-                        .directory_store
-                        .get(current_inode, part.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            tracing::error!(
-                                "Failed to find '{}' in directory inode {}: {:?}",
-                                part,
-                                current_inode,
-                                e
-                            );
-                            Status::not_found(format!(
-                                "Path component '{}' not found in directory: {}",
-                                part, e
-                            ))
-                        })?;
-                    
-                    tracing::info!(
-                        "Found '{}' -> inode {}{}",
-                        part,
-                        current_inode,
-                        if is_last { " (target)" } else { "" }
-                    );
-                }
-                _ => {
-                    return Err(Status::invalid_argument(format!(
-                        "'{}' is not a directory",
-                        part
-                    )));
-                }
-            }
-        }
-
-        // current_inode is now the source inode (from snapshot) - can be file or directory
-        let source_inode = fs_ref
-            .inode_store
-            .get(current_inode)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to read source inode: {}", e)))?;
-
-        // Check if it's a file or directory
-        let is_directory = matches!(&source_inode, Inode::Directory(_));
-        let (file_size, file_nlink) = match &source_inode {
-            Inode::File(file) => (file.size, file.nlink),
-            Inode::Directory(_) => (0, 1), // Directories don't have size
-            _ => {
-                return Err(Status::invalid_argument(
-                    "Source path must be a file or directory",
-                ));
-            }
-        };
-
-        tracing::info!(
-            "Source {} inode {} size={} nlink={} - will copy to new inode in root dataset",
-            if is_directory { "directory" } else { "file" },
-            current_inode,
-            file_size,
-            file_nlink
-        );
-
-        // Parse destination path to get directory and filename
-        let dest_parts: Vec<&str> = destination_path
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-        if dest_parts.is_empty() {
-            return Err(Status::invalid_argument(
-                "Destination path must include a filename",
-            ));
-        }
-
-        let filename = dest_parts.last().unwrap();
-        let dir_parts = &dest_parts[..dest_parts.len() - 1];
-
-        // Navigate to destination directory (start from root dataset)
-        let root_subvol = self
-            .snapshot_manager
-            .get_dataset_by_name("root")
-            .await
-            .ok_or_else(|| Status::internal("Root dataset not found"))?;
-
-        let mut dest_dir_inode = root_subvol.root_inode;
-
-        for part in dir_parts {
-            let inode = fs_ref.inode_store.get(dest_dir_inode).await.map_err(|e| {
-                Status::internal(format!("Failed to read inode {}: {}", dest_dir_inode, e))
-            })?;
-
-            match inode {
-                Inode::Directory(_) => {
-                    dest_dir_inode = fs_ref
-                        .directory_store
-                        .get(dest_dir_inode, part.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            Status::not_found(format!(
-                                "Destination directory component '{}' not found: {}",
-                                part, e
-                            ))
-                        })?;
-                }
-                _ => {
-                    return Err(Status::invalid_argument(format!(
-                        "'{}' is not a directory",
-                        part
-                    )));
-                }
-            }
-        }
-
-        // Use root auth context for instant restore (if needed in future)
-        let _auth = AuthContext {
-            uid: 0,
-            gid: 0,
-            gids: vec![],
-        };
-
-        // INSTANT RESTORE: Create a new inode in the root dataset that shares data with the snapshot inode
-        // This is COW - the data chunks are shared until modified
-        tracing::info!(
-            "Creating new inode in root dataset that shares data chunks with snapshot inode {}",
-            current_inode
-        );
-        
-        // Allocate a new inode ID in the root dataset
-        let new_inode_id = fs_ref.inode_store.allocate();
-        
-        // Clone the inode (file or directory) but with new metadata for the root dataset
-        let mut new_inode = source_inode.clone();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-            
-        match &mut new_inode {
-            Inode::File(file) => {
-                file.nlink = 1; // New inode starts with nlink=1
-                file.parent = Some(dest_dir_inode);
-                file.name = Some(filename.as_bytes().to_vec());
-                file.ctime = now;
-                file.ctime_nsec = 0;
-            }
-            Inode::Directory(dir) => {
-                // For directories, update metadata but keep entry_count
-                dir.ctime = now;
-                dir.ctime_nsec = 0;
-                dir.mtime = now;
-                dir.mtime_nsec = 0;
-            }
-            _ => {}
-        }
-        
-        // Create transaction to add the new inode
-        let mut txn = fs_ref.db.new_transaction().map_err(|e| {
-            Status::internal(format!("Failed to create transaction: {}", e))
-        })?;
-        
-        // Allocate directory cookie
-        let cookie = fs_ref
-            .directory_store
-            .allocate_cookie(dest_dir_inode, &mut txn)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to allocate cookie: {}", e)))?;
-        
-        // Add directory entry
-        fs_ref.directory_store.add(
-            &mut txn,
-            dest_dir_inode,
-            filename.as_bytes(),
-            new_inode_id,
-            cookie,
-            Some(&new_inode),
-        );
-        
-        // Save the new inode
-        fs_ref
-            .inode_store
-            .save(&mut txn, new_inode_id, &new_inode)
-            .map_err(|e| Status::internal(format!("Failed to save inode: {}", e)))?;
-        
-        // If it's a directory, clone its entries recursively
-        if is_directory {
-            tracing::info!("Cloning directory entries from {} to {}", current_inode, new_inode_id);
-            // Clone directory entries will be done after transaction commit
-        }
-        
-        // Update parent directory metadata
-        let mut dest_dir_inode_obj = fs_ref
-            .inode_store
-            .get(dest_dir_inode)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to get dest dir inode: {}", e)))?;
-
-        if let Inode::Directory(ref mut dir) = dest_dir_inode_obj {
-            dir.entry_count += 1;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            dir.mtime = now;
-            dir.mtime_nsec = 0;
-            dir.ctime = now;
-            dir.ctime_nsec = 0;
-        }
-        
-        fs_ref
-            .inode_store
-            .save(&mut txn, dest_dir_inode, &dest_dir_inode_obj)
-            .map_err(|e| Status::internal(format!("Failed to save dest dir: {}", e)))?;
-        
-        // Commit with bypass cache for immediate visibility
-        let mut seq_guard = fs_ref.write_coordinator.allocate_sequence();
-        fs_ref
-            .commit_transaction_internal(txn, &mut seq_guard, true)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to commit: {}", e)))?;
-
-        // If it's a directory, recursively clone its contents AFTER the transaction is committed
-        if is_directory {
-            tracing::info!("Starting recursive clone of directory entries from {} to {}", current_inode, new_inode_id);
-            self.clone_directory_recursive(current_inode, new_inode_id, &snapshot)
-                .await?;
-            tracing::info!("Completed recursive clone of directory from {} to {}", current_inode, new_inode_id);
-        }
-
-        tracing::info!(
-            "Instant restore complete: created new inode {} sharing data with snapshot inode {}, size {}, in dir {}",
-            new_inode_id,
-            current_inode,
-            file_size,
-            dest_dir_inode
-        );
-
-        Ok(Response::new(proto::InstantRestoreFileResponse {
-            inode_id: new_inode_id,
-            file_size,
-            nlink: 1, // New file starts with nlink=1
-        }))
+        return Err(Status::unimplemented("Use clone command instead: zerofs dataset clone"));
     }
 
     async fn clone_path(
@@ -1082,24 +422,14 @@ impl AdminService for AdminRpcServer {
                 new_inode_id
             );
             
-            // Create a temporary dataset object for the recursive clone function
-            // (it only uses the name for logging, so we can use a placeholder)
-            let temp_dataset = crate::fs::dataset::Dataset {
-                id: 0,
-                name: "live".to_string(),
-                uuid: uuid::Uuid::new_v4(),
-                created_at: 0,
-                root_inode: 0,
-                is_readonly: false,
-                is_snapshot: false,
-                parent_id: None,
-                parent_uuid: None,
-                flags: 0,
-                generation: 0,
-            };
-            
-            self.clone_directory_recursive(current_inode, new_inode_id, &temp_dataset)
+            self.clone_directory_recursive(current_inode, new_inode_id)
                 .await?;
+            
+            // Flush to ensure all cloned directory entries are persisted
+            if let Err(e) = fs_ref.db.flush().await {
+                tracing::warn!("Failed to flush after directory clone: {}", e);
+                // Continue anyway - entries are written, just not guaranteed durable yet
+            }
                 
             tracing::info!(
                 "Completed recursive clone of directory from {} to {}",

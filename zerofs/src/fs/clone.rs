@@ -1,1026 +1,185 @@
 use crate::encryption::EncryptedDb;
-use crate::fs::constants::timeouts;
-use crate::fs::dataset::{Dataset, DatasetId};
 use crate::fs::errors::FsError;
-use crate::fs::inode::{DirectoryInode, Inode, InodeId};
+use crate::fs::inode::{Inode, InodeId};
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::store::directory::DirScanValue;
-use crate::fs::store::{ChunkStore, DatasetStore, DirectoryStore, InodeStore};
+use crate::fs::store::{ChunkStore, DirectoryStore, InodeStore};
+use bytes::Bytes;
 use futures::{StreamExt, pin_mut};
 use std::sync::Arc;
 use tracing::{debug, info};
 
-fn get_current_time() -> (u64, u32) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
-    (now.as_secs(), now.subsec_nanos())
+/// Encode directory scan entry value: name + DirScanValue
+/// This matches the format expected by directory listing
+fn encode_dir_scan_value(name: &[u8], value: &DirScanValue) -> Bytes {
+    let value_bytes =
+        bincode::serialize(value).expect("DirScanValue serialization should not fail");
+    let mut buf = Vec::with_capacity(4 + name.len() + value_bytes.len());
+    buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    buf.extend_from_slice(name);
+    buf.extend_from_slice(&value_bytes);
+    Bytes::from(buf)
 }
 
-// Re-export SNAPSHOTS_ROOT_INODE from constants module for backwards compatibility
-pub use crate::fs::constants::special_inodes::SNAPSHOTS_ROOT_INODE;
-
-/// Manager for creating and managing Copy-on-Write (COW) snapshots
-pub struct SnapshotManager {
+/// Deep clone directory and all its contents recursively
+/// This creates new inodes for all files and subdirectories
+/// Data chunks are shared via CAS (COW) but inodes are independent
+pub async fn clone_directory_deep(
     db: Arc<EncryptedDb>,
-    inode_store: InodeStore,
-    dataset_store: DatasetStore,
-    directory_store: DirectoryStore,
-    chunk_store: ChunkStore,
-    writeback_cache: Option<Arc<crate::fs::writeback_cache::WritebackCache>>,
-}
+    inode_store: &InodeStore,
+    directory_store: &DirectoryStore,
+    chunk_store: &ChunkStore,
+    source_dir_id: InodeId,
+    dest_dir_id: InodeId,
+) -> Result<(), FsError> {
+    // Get all entries from source directory
+    let mut entries: Vec<(Vec<u8>, InodeId, u64)> = vec![];
+    let stream = directory_store.list_from(source_dir_id, 0).await?;
+    pin_mut!(stream);
 
-impl SnapshotManager {
-    pub fn new(
-        db: Arc<EncryptedDb>,
-        inode_store: InodeStore,
-        dataset_store: DatasetStore,
-        directory_store: DirectoryStore,
-        chunk_store: ChunkStore,
-    ) -> Self {
-        Self {
-            db,
-            inode_store,
-            dataset_store,
-            directory_store,
-            chunk_store,
-            writeback_cache: None,
-        }
-    }
-
-    pub fn with_writeback_cache(mut self, cache: Arc<crate::fs::writeback_cache::WritebackCache>) -> Self {
-        self.writeback_cache = Some(cache);
-        self
-    }
-
-    /// Ensure /snapshots directory exists, create it if it doesn't
-    async fn ensure_snapshots_root_directory(
-        &self,
-        root_dir_inode: InodeId,
-    ) -> Result<(), FsError> {
-        // Check if /snapshots directory already exists
-        if self
-            .directory_store
-            .exists(root_dir_inode, b"snapshots")
-            .await?
-        {
-            debug!("Snapshots root directory already exists");
-            return Ok(());
-        }
-
-        info!("Creating /snapshots root directory");
-        let (now_sec, _) = get_current_time();
-        
-        // Create the snapshots directory inode
-        let snapshots_dir = Inode::Directory(DirectoryInode {
-            mtime: now_sec,
-            mtime_nsec: 0,
-            ctime: now_sec,
-            ctime_nsec: 0,
-            atime: now_sec,
-            atime_nsec: 0,
-            mode: 0o755,
-            uid: 0,
-            gid: 0,
-            entry_count: 0,
-            parent: root_dir_inode, // Parent is root
-            name: Some(b"snapshots".to_vec()),
-            nlink: 2,
-        });
-
-        // Save the snapshots directory inode (directly to DB, not in transaction)
-        let serialized = bincode::serialize(&snapshots_dir).map_err(|_| FsError::IoError)?;
-        let key = KeyCodec::inode_key(SNAPSHOTS_ROOT_INODE);
-        self.db
-            .put_with_options(
-            &key,
-            &serialized,
-            &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-        )
-        .await
-        .map_err(|_| FsError::IoError)?;
-
-        // Add entry in root directory pointing to /snapshots
-        let cookie_key = KeyCodec::dir_cookie_counter_key(root_dir_inode);
-        let cookie: u64 = match self.db.get_bytes(&cookie_key).await {
-            Ok(Some(val)) => {
-                let bytes: [u8; 8] = val.as_ref().try_into().map_err(|_| FsError::IoError)?;
-                u64::from_be_bytes(bytes)
-            }
-            _ => crate::fs::store::directory::COOKIE_FIRST_ENTRY,
-        };
-        
-        let new_cookie = cookie + 1;
-        self.db
-            .put_with_options(
-            &cookie_key,
-            &new_cookie.to_be_bytes(),
-            &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-        )
-        .await
-        .map_err(|_| FsError::IoError)?;
-
-        // Add directory entry
-        let entry_key = KeyCodec::dir_entry_key(root_dir_inode, b"snapshots");
-        self.db
-            .put_with_options(
-            &entry_key,
-            &SNAPSHOTS_ROOT_INODE.to_be_bytes(),
-            &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-        )
-        .await
-        .map_err(|_| FsError::IoError)?;
-
-        let scan_key = KeyCodec::dir_scan_key(root_dir_inode, cookie);
-        let scan_value = DirScanValue::Reference {
-            inode_id: SNAPSHOTS_ROOT_INODE,
-        };
-        let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
-        self.db
-            .put_with_options(
-            &scan_key,
-                &scan_value_bytes,
-            &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-        )
-        .await
-        .map_err(|_| FsError::IoError)?;
-
-        info!("Created /snapshots directory at root");
-        Ok(())
-    }
-
-    /// Create a directory entry for a snapshot in /snapshots/
-    async fn create_snapshot_directory(
-        &self,
-        snapshot_name: &str,
-        snapshot_root_inode: InodeId,
-        created_at: u64,
-    ) -> Result<(), FsError> {
-        debug!(
-            "Creating snapshot directory entry: /snapshots/{}",
-            snapshot_name
-        );
-
-        // The snapshot already has a root inode, we just need to add it to /snapshots directory
-        // First, update the snapshot root's parent to point to snapshots directory
-        let mut snapshot_root = self.inode_store.get(snapshot_root_inode).await?;
-        
-        if let Inode::Directory(dir) = &mut snapshot_root {
-            dir.parent = SNAPSHOTS_ROOT_INODE;
-            dir.name = Some(snapshot_name.as_bytes().to_vec());
-        } else {
-            return Err(FsError::NotDirectory);
-        }
-
-        // Save updated snapshot root
-        let serialized = bincode::serialize(&snapshot_root).map_err(|_| FsError::IoError)?;
-        let key = KeyCodec::inode_key(snapshot_root_inode);
-        self.db
-            .put_with_options(
-            &key,
-            &serialized,
-            &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-        )
-        .await
-        .map_err(|_| FsError::IoError)?;
-
-        // Add directory entry in /snapshots/ pointing to the snapshot root
-        let cookie_key = KeyCodec::dir_cookie_counter_key(SNAPSHOTS_ROOT_INODE);
-        let cookie: u64 = match self.db.get_bytes(&cookie_key).await {
-            Ok(Some(val)) => {
-                let bytes: [u8; 8] = val.as_ref().try_into().map_err(|_| FsError::IoError)?;
-                u64::from_be_bytes(bytes)
-            }
-            _ => crate::fs::store::directory::COOKIE_FIRST_ENTRY,
-        };
-        
-        let new_cookie = cookie + 1;
-        self.db
-            .put_with_options(
-            &cookie_key,
-            &new_cookie.to_be_bytes(),
-            &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-        )
-        .await
-        .map_err(|_| FsError::IoError)?;
-
-        let entry_key = KeyCodec::dir_entry_key(SNAPSHOTS_ROOT_INODE, snapshot_name.as_bytes());
-        self.db
-            .put_with_options(
-            &entry_key,
-            &snapshot_root_inode.to_be_bytes(),
-            &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-        )
-        .await
-        .map_err(|_| FsError::IoError)?;
-
-        let scan_key = KeyCodec::dir_scan_key(SNAPSHOTS_ROOT_INODE, cookie);
-        let scan_value = DirScanValue::Reference {
-            inode_id: snapshot_root_inode,
-        };
-        let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
-        self.db
-            .put_with_options(
-            &scan_key,
-                &scan_value_bytes,
-            &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-        )
-        .await
-        .map_err(|_| FsError::IoError)?;
-
-        // Update /snapshots directory metadata
-        let mut snapshots_dir_inode = self.inode_store.get(SNAPSHOTS_ROOT_INODE).await?;
-        if let Inode::Directory(dir) = &mut snapshots_dir_inode {
-            dir.entry_count += 1;
-            dir.mtime = created_at;
-            dir.mtime_nsec = 0;
-            dir.ctime = created_at;
-            dir.ctime_nsec = 0;
-        }
-        let serialized = bincode::serialize(&snapshots_dir_inode).map_err(|_| FsError::IoError)?;
-        let key = KeyCodec::inode_key(SNAPSHOTS_ROOT_INODE);
-        self.db
-            .put_with_options(
-            &key,
-            &serialized,
-            &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-        )
-        .await
-        .map_err(|_| FsError::IoError)?;
-
-        info!("Created snapshot directory: /snapshots/{}", snapshot_name);
-        Ok(())
-    }
-
-    /// Allocate a new inode ID
-    pub fn allocate_inode(&self) -> InodeId {
-        self.inode_store.allocate()
-    }
-
-    /// Create a new dataset
-    pub async fn create_dataset(
-        &self,
-        name: String,
-        root_inode: InodeId,
-        created_at: u64,
-        is_readonly: bool,
-    ) -> Result<Dataset, FsError> {
-        self.dataset_store
-            .create_dataset(name, root_inode, created_at, is_readonly)
-            .await
-    }
-
-    /// List all datasets
-    pub async fn list_datasets(&self) -> Vec<Dataset> {
-        self.dataset_store.list_datasets().await
-    }
-
-    /// Get dataset by name
-    pub async fn get_dataset_by_name(&self, name: &str) -> Option<Dataset> {
-        self.dataset_store.get_by_name(name).await
-    }
-
-    /// Delete dataset by name
-    pub async fn delete_dataset(&self, name: &str) -> Result<(), FsError> {
-        // Get the dataset by name
-        let dataset = self
-            .dataset_store
-            .get_by_name(name)
-            .await
-            .ok_or(FsError::NotFound)?;
-        
-        self.dataset_store.delete_dataset(dataset.id).await?;
-        Ok(())
-    }
-
-    /// Set default dataset by name
-    pub async fn set_default_dataset(&self, name: &str) -> Result<(), FsError> {
-        let dataset = self
-            .dataset_store
-            .get_by_name(name)
-            .await
-            .ok_or(FsError::NotFound)?;
-        
-        self.dataset_store.set_default(dataset.id).await
-    }
-
-    /// Get default dataset ID
-    pub async fn get_default_dataset(&self) -> DatasetId {
-        self.dataset_store.get_default().await
-    }
-
-    /// Create a snapshot by dataset name
-    pub async fn create_snapshot_by_name(
-        &self,
-        source_name: &str,
-        snapshot_name: String,
-        created_at: u64,
-        is_readonly: bool,
-    ) -> Result<Dataset, FsError> {
-        let source = self
-            .dataset_store
-            .get_by_name(source_name)
-            .await
-            .ok_or(FsError::NotFound)?;
-        
-        self.create_snapshot(source.id, snapshot_name, created_at, is_readonly)
-            .await
-    }
-
-    /// Delete snapshot by name
-    pub async fn delete_snapshot_by_name(&self, name: &str) -> Result<(), FsError> {
-        let snapshot = self
-            .dataset_store
-            .get_by_name(name)
-            .await
-            .ok_or(FsError::NotFound)?;
-        
-        if !snapshot.is_snapshot {
-            return Err(FsError::InvalidArgument);
-        }
-        
-        self.delete_snapshot(snapshot.id).await
-    }
-
-    /// Create a snapshot of a dataset
-    /// This creates a COW snapshot by cloning the root directory inode
-    /// The actual data chunks are shared until modified (copy-on-write)
-    /// Also creates a real directory entry at /snapshots/<name>/ for NFS access
-    pub async fn create_snapshot(
-        &self,
-        source_id: DatasetId,
-        snapshot_name: String,
-        created_at: u64,
-        is_readonly: bool,
-    ) -> Result<Dataset, FsError> {
-        if self.db.is_read_only() {
-            return Err(FsError::ReadOnlyFilesystem);
-        }
-
-        // CRITICAL: Flush writeback cache before snapshot to ensure all data is captured
-        // This ensures newly created/modified files are visible in the snapshot
-        if let Some(ref cache) = self.writeback_cache {
-            tracing::info!("Flushing writeback cache before snapshot creation...");
-            cache.flush_now(self.db.as_ref()).await?;
-            tracing::info!("Writeback cache flushed successfully");
-        }
-        
-        // Flush database to ensure all pending writes are visible when listing directory entries
-        // Use a timeout to prevent hanging on large datasets
-        tracing::info!("Flushing database before listing directory entries...");
-        match tokio::time::timeout(
-            timeouts::CACHE_FLUSH_TIMEOUT,
-            self.db.flush()
-        ).await {
-            Ok(Ok(_)) => {
-                tracing::info!("Database flushed successfully before listing");
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("Database flush failed: {:?}, continuing anyway", e);
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "Database flush timed out after {:?}, continuing anyway",
-                    timeouts::CACHE_FLUSH_TIMEOUT
-                );
-            }
-        }
-
-        // Get the source dataset
-        let source = self
-            .dataset_store
-            .get_by_id(source_id)
-            .await
-            .ok_or(FsError::NotFound)?;
-
-        // Clone the root inode of the source dataset
-        let source_root_inode = self.inode_store.get(source.root_inode).await?;
-        
-        // Create a new inode for the snapshot root
-        let snapshot_root_id = self.inode_store.allocate();
-        
-        // Clone the directory inode
-        let snapshot_root = match source_root_inode {
-            Inode::Directory(dir) => {
-                // Clone the directory metadata
-                Inode::Directory(DirectoryInode {
-                    mtime: dir.mtime,
-                    mtime_nsec: dir.mtime_nsec,
-                    ctime: created_at,
-                    ctime_nsec: 0,
-                    atime: dir.atime,
-                    atime_nsec: dir.atime_nsec,
-                    mode: dir.mode,
-                    uid: dir.uid,
-                    gid: dir.gid,
-                    entry_count: dir.entry_count,
-                    parent: snapshot_root_id, // Will be updated later to point to /snapshots
-                    name: None,               // Will be updated later
-                    nlink: dir.nlink,
-                })
-            }
-            _ => return Err(FsError::NotDirectory),
-        };
-
-        // Ensure /snapshots directory exists (create in actual root, inode 0)
-        self.ensure_snapshots_root_directory(0).await?;
-
-        // Save the cloned root inode
-        let serialized = bincode::serialize(&snapshot_root).map_err(|_| FsError::IoError)?;
-        let key = KeyCodec::inode_key(snapshot_root_id);
-        self.db
-            .put_with_options(
-            &key,
-            &serialized,
-            &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-        )
-        .await
-        .map_err(|_| FsError::IoError)?;
-
-        // Create the snapshot metadata in dataset store
-        let snapshot = self
-            .dataset_store
-            .create_snapshot(
-                source_id,
-                snapshot_name.clone(),
-                snapshot_root_id,
-                created_at,
-                is_readonly,
-            )
-            .await?;
-
-        // Deep clone directory entries and all inodes recursively (COW - data chunks shared)
-        tracing::info!("Starting deep clone of directory {} to {}", source.root_inode, snapshot_root_id);
-        self.clone_directory_deep(source.root_inode, snapshot_root_id)
-            .await?;
-        tracing::info!("Deep clone completed successfully");
-        
-        // Flush to ensure all entries are persisted (with timeout to prevent hanging)
-        tracing::info!("Flushing database to ensure snapshot durability...");
-        match tokio::time::timeout(
-            timeouts::DB_FLUSH_TIMEOUT,
-            self.db.flush()
-        ).await {
-            Ok(Ok(_)) => {
-                tracing::info!("Database flushed successfully");
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "Database flush failed: {:?}, but snapshot creation will continue", 
-                    e
-                );
-                // Continue anyway - snapshot is created, just not guaranteed durable yet
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "Database flush timed out after {:?}, but snapshot creation will continue",
-                    timeouts::DB_FLUSH_TIMEOUT
-                );
-                // Continue anyway - snapshot is created, just not guaranteed durable yet
-            }
-        }
-
-        // Create real directory entry for the snapshot in /snapshots/
-        self.create_snapshot_directory(&snapshot_name, snapshot_root_id, created_at)
-            .await?;
-
-        info!(
-            "Snapshot '{}' created with real directory at /snapshots/{}",
-            snapshot_name, snapshot_name
-        );
-        Ok(snapshot)
-    }
-
-    /// Get the next cookie for a directory entry
-    async fn get_next_cookie(&self, dir_inode: InodeId) -> Result<u64, FsError> {
-        let cookie_key = KeyCodec::dir_cookie_counter_key(dir_inode);
-        let cookie: u64 = match self.db.get_bytes(&cookie_key).await {
-            Ok(Some(val)) => {
-                let bytes: [u8; 8] = val.as_ref().try_into().map_err(|_| FsError::IoError)?;
-                u64::from_be_bytes(bytes)
-            }
-            _ => crate::fs::store::directory::COOKIE_FIRST_ENTRY,
-        };
-        
-        let new_cookie = cookie + 1;
-        self.db
-            .put_with_options(
-                &cookie_key,
-                &new_cookie.to_be_bytes(),
-                &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
-        
-        Ok(cookie)
-    }
-
-    /// Deep clone directory and all its contents recursively
-    /// This creates new inodes for all files and subdirectories
-    /// Data chunks are shared (COW) but inodes are independent
-    async fn clone_directory_deep(
-        &self,
-        source_dir_id: InodeId,
-        dest_dir_id: InodeId,
-    ) -> Result<(), FsError> {
-        use crate::fs::inode::Inode;
-        
-        // Get all entries from source directory
-        let mut entries: Vec<(Vec<u8>, InodeId, u64)> = vec![];
-        let stream = self.directory_store.list_from(source_dir_id, 0).await?;
-        pin_mut!(stream);
-
-        while let Some(result) = stream.next().await {
-            let entry = match result {
-                Ok(e) => e,
-                Err(FsError::InvalidData) => {
-                    tracing::warn!("Skipping corrupted entry in directory {}", source_dir_id);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            entries.push((entry.name.clone(), entry.inode_id, entry.cookie));
-        }
-
-        tracing::info!(
-            "Deep cloning {} entries from directory {} to {}",
-            entries.len(),
-            source_dir_id,
-            dest_dir_id
-        );
-        
-        // Log first few entry names for debugging
-        for (idx, (name, inode_id, _)) in entries.iter().take(5).enumerate() {
-            tracing::info!(
-                "Entry {}: '{}' (inode {})",
-                idx,
-                String::from_utf8_lossy(name),
-                inode_id
-            );
-        }
-        if entries.len() > 5 {
-            tracing::info!("... and {} more entries", entries.len() - 5);
-        }
-
-        let mut cloned_count = 0;
-        let mut skipped_count = 0;
-        let total_entries = entries.len();
-        tracing::info!("Starting to process {} entries for deep clone", total_entries);
-        
-        for (idx, (name, source_inode_id, _cookie)) in entries.into_iter().enumerate() {
-            let name_str = String::from_utf8_lossy(&name);
-            
-            // Log progress every 5 entries
-            if idx % 5 == 0 {
-                tracing::info!("Progress: {}/{} entries processed (cloned: {}, skipped: {})", 
-                    idx, total_entries, cloned_count, skipped_count);
-            }
-            
-            // Skip . and .. entries
-            if name_str == "." || name_str == ".." {
-                skipped_count += 1;
+    while let Some(result) = stream.next().await {
+        let entry = match result {
+            Ok(e) => e,
+            Err(FsError::InvalidData) => {
+                debug!("Skipping corrupted entry in directory {}", source_dir_id);
                 continue;
             }
-            
-            // Note: Inode ID validation is now centralized in directory.rs::decode_dir_scan_value()
-            // Corrupted entries are rejected at read time and never reach this code
-            
-            tracing::debug!(
-                "Processing entry '{}' (inode {}) for deep clone",
-                name_str,
-                source_inode_id
-            );
-            
-            // Get the source inode
-            tracing::debug!("Getting inode {} for entry '{}'", source_inode_id, name_str);
-            let source_inode = match self.inode_store.get(source_inode_id).await {
-                Ok(inode) => inode,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to get inode {} for entry '{}': {}. Skipping.",
-                        source_inode_id,
-                        name_str,
-                        e
-                    );
-                    continue; // Skip entries with missing inodes instead of failing entire snapshot
-                }
-            };
-            
-            // Allocate new inode ID for the clone
-            let new_inode_id = self.inode_store.allocate();
-            
-            // Clone the inode (COW for data chunks)
-            let cloned_inode = source_inode.clone();
-            let is_directory = matches!(cloned_inode, Inode::Directory(_));
-            let is_file = matches!(cloned_inode, Inode::File(_));
-            
-            tracing::info!(
-                "Deep cloning entry '{}': source inode {} -> new inode {} (type: {})",
-                name_str,
+            Err(e) => return Err(e),
+        };
+        entries.push((entry.name.clone(), entry.inode_id, entry.cookie));
+    }
+
+    info!(
+        "Deep cloning {} entries from directory {} to {}",
+        entries.len(),
+        source_dir_id,
+        dest_dir_id
+    );
+
+    let mut cloned_count = 0;
+    let mut skipped_count = 0;
+    
+    for (name, source_inode_id, _cookie) in entries {
+        let name_str = String::from_utf8_lossy(&name);
+        
+        // Skip . and .. entries
+        if name_str == "." || name_str == ".." {
+            skipped_count += 1;
+            continue;
+        }
+        
+        debug!("Cloning entry '{}' (inode {})", name_str, source_inode_id);
+        
+        // Get the source inode
+        let source_inode = match inode_store.get(source_inode_id).await {
+            Ok(inode) => inode,
+            Err(e) => {
+                debug!("Failed to get inode {} for entry '{}': {}. Skipping.", source_inode_id, name_str, e);
+                continue;
+            }
+        };
+        
+        // Allocate new inode ID for the clone
+        let new_inode_id = inode_store.allocate();
+        
+        // Clone the inode (COW for data chunks via CAS)
+        let cloned_inode = source_inode.clone();
+        let is_directory = matches!(cloned_inode, Inode::Directory(_));
+        
+        // Save the cloned inode
+        let inode_key = KeyCodec::inode_key(new_inode_id);
+        let inode_bytes = bincode::serialize(&cloned_inode).map_err(|_| FsError::IoError)?;
+        db.put_with_options(
+            &inode_key,
+            &inode_bytes,
+            &slatedb::config::PutOptions::default(),
+            &slatedb::config::WriteOptions {
+                await_durable: false, // Batch writes for performance, flush at end
+            },
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
+        
+        // Note: With CAS, files automatically share chunks via hash references
+        // No need to copy chunk metadata - the cloned inode's chunks vector
+        // already points to the same chunk hashes
+        
+        // Get next cookie for directory entry
+        let cookie_key = KeyCodec::dir_cookie_counter_key(dest_dir_id);
+        let cookie: u64 = match db.get_bytes(&cookie_key).await {
+            Ok(Some(val)) => {
+                let bytes: [u8; 8] = val.as_ref().try_into().map_err(|_| FsError::IoError)?;
+                u64::from_be_bytes(bytes)
+            }
+            _ => crate::fs::store::directory::COOKIE_FIRST_ENTRY,
+        };
+        
+        let new_cookie = cookie + 1;
+        db.put_with_options(
+            &cookie_key,
+            &new_cookie.to_be_bytes(),
+            &slatedb::config::PutOptions::default(),
+            &slatedb::config::WriteOptions {
+                await_durable: false, // Batch writes for performance, flush at end
+            },
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
+        
+        // Create directory entry in destination
+        let entry_key = KeyCodec::dir_entry_key(dest_dir_id, &name);
+        let entry_value = KeyCodec::encode_dir_entry(new_inode_id, cookie);
+        db.put_with_options(
+            &entry_key,
+            &entry_value,
+            &slatedb::config::PutOptions::default(),
+            &slatedb::config::WriteOptions {
+                await_durable: false, // Batch writes for performance, flush at end
+            },
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
+        
+        // Create dir_scan entry with proper encoding (name + DirScanValue)
+        let scan_key = KeyCodec::dir_scan_key(dest_dir_id, cookie);
+        let scan_value = DirScanValue::Reference {
+            inode_id: new_inode_id,
+        };
+        let scan_value_bytes = encode_dir_scan_value(&name, &scan_value);
+        db.put_with_options(
+            &scan_key,
+            &scan_value_bytes,
+            &slatedb::config::PutOptions::default(),
+            &slatedb::config::WriteOptions {
+                await_durable: false, // Batch writes for performance, flush at end
+            },
+        )
+        .await
+        .map_err(|_| FsError::IoError)?;
+        
+        // If it's a directory, recursively clone its contents
+        if is_directory {
+            Box::pin(clone_directory_deep(
+                db.clone(),
+                inode_store,
+                directory_store,
+                chunk_store,
                 source_inode_id,
                 new_inode_id,
-                if is_directory { "directory" } else if is_file { "file" } else { "other" }
-            );
-            
-            // Save the cloned inode (non-durable for performance, flushed at end)
-            let inode_key = KeyCodec::inode_key(new_inode_id);
-            let inode_bytes = bincode::serialize(&cloned_inode).map_err(|_| FsError::IoError)?;
-            self.db
-                .put_with_options(
-                    &inode_key,
-                    &inode_bytes,
-                    &slatedb::config::PutOptions::default(),
-                    &slatedb::config::WriteOptions {
-                        await_durable: false, // Batch writes for performance
-                    },
-                )
-                .await
-                .map_err(|_| FsError::IoError)?;
-            
-            // For files, copy all chunk metadata to enable COW
-            if is_file {
-                if let Inode::File(ref file_inode) = cloned_inode {
-                    tracing::debug!(
-                        "Copying chunks for file '{}' (size={} bytes)",
-                        name_str,
-                        file_inode.size
-                    );
-                    self.chunk_store
-                        .copy_chunks_for_cow(source_inode_id, new_inode_id, file_inode.size)
-                        .await?;
-                }
-            }
-            
-            // Allocate cookie for directory entry
-            let cookie = self.get_next_cookie(dest_dir_id).await?;
-            
-            // Create directory entry in destination (non-durable for performance)
-            let entry_key = KeyCodec::dir_entry_key(dest_dir_id, &name);
-            let entry_value = KeyCodec::encode_dir_entry(new_inode_id, cookie);
-            self.db
-                .put_with_options(
-                    &entry_key,
-                    &entry_value,
-                    &slatedb::config::PutOptions::default(),
-                    &slatedb::config::WriteOptions {
-                        await_durable: false, // Batch writes for performance
-                    },
-                )
-                .await
-                .map_err(|_| FsError::IoError)?;
-            
-            // Create dir_scan entry (non-durable for performance)
-            let scan_key = KeyCodec::dir_scan_key(dest_dir_id, cookie);
-            let scan_value = DirScanValue::Reference {
-                inode_id: new_inode_id,
-            };
-            let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
-            self.db
-                .put_with_options(
-                    &scan_key,
-                    &scan_value_bytes,
-                    &slatedb::config::PutOptions::default(),
-                    &slatedb::config::WriteOptions {
-                        await_durable: false, // Batch writes for performance
-                    },
-                )
-                .await
-                .map_err(|_| FsError::IoError)?;
-            
-            // If it's a directory, recursively clone its contents
-            if is_directory {
-                tracing::info!(
-                    "Recursively cloning subdirectory '{}' (source: {}, dest: {})",
-                    name_str,
-                    source_inode_id,
-                    new_inode_id
-                );
-                Box::pin(self.clone_directory_deep(source_inode_id, new_inode_id)).await?;
-            }
-            
-            cloned_count += 1;
-        }
-
-        tracing::info!(
-            "Completed deep cloning: {} entries cloned, {} skipped from directory {} to {}",
-            cloned_count,
-            skipped_count,
-            source_dir_id,
-            dest_dir_id
-        );
-
-        Ok(())
-    }
-
-    /// Clone directory entries from source to destination
-    /// This performs a shallow copy - directory entries point to the same inodes
-    /// Subdirectories share their inode IDs and directory entries (true COW)
-    /// Actual COW happens when those inodes are modified
-    async fn clone_directory_entries(
-        &self,
-        source_dir_id: InodeId,
-        dest_dir_id: InodeId,
-    ) -> Result<(), FsError> {
-        // Use DirectoryStore to iterate through entries
-        let mut entries: Vec<(Vec<u8>, InodeId, u64)> = vec![];
-        let mut count = 0;
-        const MAX_ENTRIES: usize = 100000; // Safety limit
-        
-        let stream = self.directory_store.list_from(source_dir_id, 0).await?;
-        pin_mut!(stream);
-
-        while let Some(result) = stream.next().await {
-            if count >= MAX_ENTRIES {
-                tracing::error!(
-                    "Directory {} has more than {} entries - aborting clone",
-                    source_dir_id,
-                    MAX_ENTRIES
-                );
-                return Err(FsError::IoError);
-            }
-            
-            // Skip corrupted entries (InvalidData error from decode)
-            let entry = match result {
-                Ok(e) => e,
-                Err(FsError::InvalidData) => {
-                    tracing::warn!("Skipping corrupted entry in directory {}", source_dir_id);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            
-            entries.push((entry.name.clone(), entry.inode_id, entry.cookie));
-            count += 1;
-            
-            if count % 100 == 0 {
-                tracing::debug!("Scanned {} entries from directory {}", count, source_dir_id);
-            }
-        }
-
-        // Write cloned entries to destination directory
-        let num_entries = entries.len();
-        tracing::info!(
-            "Cloning {} entries from source inode {} to dest inode {}",
-            num_entries,
-            source_dir_id,
-            dest_dir_id
-        );
-        for (name, inode_id, cookie) in entries {
-            let name_str = String::from_utf8_lossy(&name);
-            
-            tracing::debug!(
-                "Cloning entry '{}' (inode {}) from {} to {}",
-                name_str,
-                inode_id,
-                source_dir_id,
-                dest_dir_id
-            );
-            
-            // Create dir_entry key for destination
-            let entry_key = KeyCodec::dir_entry_key(dest_dir_id, &name);
-            let entry_value = KeyCodec::encode_dir_entry(inode_id, cookie);
-            tracing::info!(
-                "Writing entry '{}' to dest inode {}: key={:?}, inode_id={}",
-                name_str,
-                dest_dir_id,
-                entry_key,
-                inode_id
-            );
-            self.db
-                .put_with_options(
-                &entry_key,
-                &entry_value,
-                &slatedb::config::PutOptions::default(),
-                    &slatedb::config::WriteOptions {
-                        await_durable: false,
-                    },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
-
-            // Create dir_scan key for destination
-            let scan_key = KeyCodec::dir_scan_key(dest_dir_id, cookie);
-            let scan_value = DirScanValue::Reference { inode_id };
-            let scan_value_bytes = bincode::serialize(&scan_value).map_err(|_| FsError::IoError)?;
-            self.db
-                .put_with_options(
-                &scan_key,
-                    &scan_value_bytes,
-                &slatedb::config::PutOptions::default(),
-                    &slatedb::config::WriteOptions {
-                        await_durable: false,
-                    },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
-            
-            // Verify the entry was written and is readable
-            let verify = self
-                .db
-                .get_bytes(&entry_key)
-                .await
-                .map_err(|_| FsError::IoError)?;
-            if verify.is_none() {
-                tracing::error!(
-                    "Failed to verify directory entry '{}' was written to inode {}",
-                    name_str,
-                    dest_dir_id
-                );
-                return Err(FsError::IoError);
-            }
-            tracing::debug!(
-                "Verified entry '{}' is readable in inode {}",
-                name_str,
-                dest_dir_id
-            );
-
-            // Increment nlink on the referenced inode (COW - same inode is now referenced by snapshot)
-            let inode = self.inode_store.get(inode_id).await?;
-            let updated_inode = self.increment_nlink(inode)?;
-            let serialized = bincode::serialize(&updated_inode).map_err(|_| FsError::IoError)?;
-            let inode_key = KeyCodec::inode_key(inode_id);
-            self.db
-                .put_with_options(
-                &inode_key,
-                &serialized,
-                &slatedb::config::PutOptions::default(),
-                    &slatedb::config::WriteOptions {
-                        await_durable: false,
-                    },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
-        }
-
-        // Clone the cookie counter
-        let source_counter_key = KeyCodec::dir_cookie_counter_key(source_dir_id);
-        if let Some(counter_data) = self
-            .db
-            .get_bytes(&source_counter_key)
-            .await
-            .map_err(|_| FsError::IoError)?
-        {
-            let dest_counter_key = KeyCodec::dir_cookie_counter_key(dest_dir_id);
-            self.db
-                .put_with_options(
-                &dest_counter_key,
-                &counter_data,
-                &slatedb::config::PutOptions::default(),
-                    &slatedb::config::WriteOptions {
-                        await_durable: false,
-                    },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+            ))
+            .await?;
         }
         
-        tracing::info!(
-            "Successfully cloned and verified all {} entries from inode {} to inode {}",
-            num_entries,
-            source_dir_id,
-            dest_dir_id
-        );
-
-        Ok(())
+        cloned_count += 1;
     }
 
-    /// Increment nlink count on an inode
-    fn increment_nlink(&self, inode: Inode) -> Result<Inode, FsError> {
-        match inode {
-            Inode::File(mut f) => {
-                f.nlink = f.nlink.saturating_add(1);
-                Ok(Inode::File(f))
-            }
-            Inode::Directory(mut d) => {
-                d.nlink = d.nlink.saturating_add(1);
-                Ok(Inode::Directory(d))
-            }
-            Inode::Symlink(mut s) => {
-                s.nlink = s.nlink.saturating_add(1);
-                Ok(Inode::Symlink(s))
-            }
-            Inode::Fifo(mut s) => {
-                s.nlink = s.nlink.saturating_add(1);
-                Ok(Inode::Fifo(s))
-            }
-            Inode::Socket(mut s) => {
-                s.nlink = s.nlink.saturating_add(1);
-                Ok(Inode::Socket(s))
-            }
-            Inode::CharDevice(mut s) => {
-                s.nlink = s.nlink.saturating_add(1);
-                Ok(Inode::CharDevice(s))
-            }
-            Inode::BlockDevice(mut s) => {
-                s.nlink = s.nlink.saturating_add(1);
-                Ok(Inode::BlockDevice(s))
-            }
-        }
-    }
+    info!(
+        "Completed deep cloning: {} entries cloned, {} skipped from directory {} to {}",
+        cloned_count,
+        skipped_count,
+        source_dir_id,
+        dest_dir_id
+    );
 
-    /// Delete a snapshot
-    /// This decrements reference counts on all inodes in the snapshot
-    pub async fn delete_snapshot(&self, snapshot_id: DatasetId) -> Result<(), FsError> {
-        if self.db.is_read_only() {
-            return Err(FsError::ReadOnlyFilesystem);
-        }
-
-        // Get the snapshot
-        let snapshot = self
-            .dataset_store
-            .get_by_id(snapshot_id)
-            .await
-            .ok_or(FsError::NotFound)?;
-
-        if !snapshot.is_snapshot {
-            return Err(FsError::InvalidArgument);
-        }
-
-        // TODO: Implement recursive deletion of snapshot tree
-        // For now, just remove it from the registry
-        self.dataset_store.delete_dataset(snapshot_id).await?;
-
-        Ok(())
-    }
-
-    /// List all snapshots
-    pub async fn list_snapshots(&self) -> Vec<Dataset> {
-        self.dataset_store.list_snapshots().await
-    }
-
-    /// Get snapshot info
-    pub async fn get_snapshot(&self, snapshot_id: DatasetId) -> Option<Dataset> {
-        self.dataset_store.get_by_id(snapshot_id).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fs::ZeroFS;
-
-    #[tokio::test]
-    async fn test_snapshot_creation() {
-        let encryption_key = [0u8; 32];
-        let fs = ZeroFS::new_in_memory_with_encryption(encryption_key)
-            .await
-            .unwrap();
-
-        let snapshot_manager = SnapshotManager::new(
-            fs.db.clone(),
-            fs.inode_store.clone(),
-            fs.dataset_store.clone(),
-            fs.directory_store.clone(),
-            fs.chunk_store.clone(),
-        );
-
-        // Create a snapshot of the root dataset
-        let snapshot = snapshot_manager
-            .create_snapshot(0, "test-snapshot".to_string(), 5000)
-            .await
-            .unwrap();
-
-        assert_eq!(snapshot.name, "test-snapshot");
-        assert!(snapshot.is_snapshot);
-        assert!(snapshot.is_readonly);
-        assert_eq!(snapshot.parent_id, Some(0));
-
-        // Verify the snapshot appears in the list
-        let snapshots = snapshot_manager.list_snapshots().await;
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].name, "test-snapshot");
-    }
+    Ok(())
 }

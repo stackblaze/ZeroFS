@@ -8,7 +8,7 @@ pub mod key_codec;
 pub mod lock_manager;
 pub mod metrics;
 pub mod permissions;
-pub mod snapshot_manager;
+pub mod clone;
 pub mod snapshot_vfs;
 pub mod stats;
 pub mod store;

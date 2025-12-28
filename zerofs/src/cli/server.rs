@@ -210,7 +210,6 @@ async fn start_nbd_servers(
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
-    snapshot_manager: Arc<crate::fs::snapshot_manager::SnapshotManager>,
     tracer: AccessTracer,
     fs: Arc<crate::fs::ZeroFS>,
     shutdown: CancellationToken,
@@ -222,7 +221,6 @@ async fn start_rpc_servers(
 
     let service = crate::rpc::server::AdminRpcServer::new(
         checkpoint_manager,
-        snapshot_manager,
         tracer,
         fs.clone(),
     );
@@ -819,26 +817,9 @@ pub async fn run_server(
         init_result.object_store,
     ));
 
-    // Create snapshot manager
-    let mut snapshot_manager = crate::fs::snapshot_manager::SnapshotManager::new(
-        fs.db.clone(),
-        fs.inode_store.clone(),
-        (*fs.dataset_store).clone(),
-        fs.directory_store.clone(),
-        fs.chunk_store.clone(),
-    );
-
-    // Add writeback cache awareness to snapshot manager
-    if let Some(ref cache) = fs.writeback_cache {
-        snapshot_manager = snapshot_manager.with_writeback_cache(cache.clone());
-    }
-
-    let snapshot_manager = Arc::new(snapshot_manager);
-
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
-        snapshot_manager,
         fs.tracer.clone(),
         fs.clone(),
         shutdown.clone(),
