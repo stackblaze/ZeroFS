@@ -78,6 +78,8 @@ chrono = "0.4"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 fail = { version = "0.5", features = ["failpoints"], optional = true }
+blake3 = "1.8.2"
+hex = "0.4.3"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

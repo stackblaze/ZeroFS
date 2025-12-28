@@ -54,7 +54,7 @@ use self::types::{
     AuthContext, DirEntry, FileAttributes, FileType, InodeWithId, ReadDirResult, SetAttributes,
     SetGid, SetMode, SetSize, SetTime, SetUid,
 };
-use ::tracing::{debug, error, warn};
+use ::tracing::{debug, error, info, warn};
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
@@ -550,7 +550,24 @@ impl ZeroFS {
 
                 let mut txn = self.db.new_transaction()?;
 
-                self.chunk_store.write(&mut txn, id, offset, data).await?;
+                // Migrate to CAS if not already using it
+                if file.chunks.is_none() {
+                    info!("Migrating inode {} to CAS on write", id);
+                    file.chunks = Some(Vec::new());
+                } else {
+                    info!("Inode {} already using CAS (has {} chunks)", id, file.chunks.as_ref().unwrap().len());
+                }
+
+                // Use CAS for writes
+                if let Some(ref mut chunks) = file.chunks {
+                    info!("Writing {} bytes to inode {} using CAS", data.len(), id);
+                    self.chunk_store.write_cas(chunks, offset, data).await?;
+                    info!("After write, inode {} has {} chunks", id, chunks.len());
+                } else {
+                    // Fallback to legacy write (should not happen after migration above)
+                    warn!("Using legacy write for inode {} (CAS not initialized)", id);
+                    self.chunk_store.write(&mut txn, id, offset, data).await?;
+                }
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::WRITE_AFTER_CHUNK);
@@ -692,6 +709,7 @@ impl ZeroFS {
                     parent: Some(dirid),
                     name: Some(name.to_vec()),
                     nlink: 1,
+                    chunks: Some(Vec::new()),  // Initialize with CAS
                 };
 
                 let mut txn = self.db.new_transaction()?;
@@ -822,7 +840,14 @@ impl ZeroFS {
                 }
 
                 let read_len = std::cmp::min(count as u64, file.size - offset);
-                let result_bytes = self.chunk_store.read(id, offset, read_len).await?;
+                
+                // Use CAS if available, otherwise fall back to legacy
+                let result_bytes = if let Some(ref chunks) = file.chunks {
+                    self.chunk_store.read_cas(chunks, offset, read_len).await?
+                } else {
+                    self.chunk_store.read(id, offset, read_len).await?
+                };
+                
                 let eof = offset + read_len >= file.size;
 
                 self.stats

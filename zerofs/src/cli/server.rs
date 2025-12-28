@@ -825,6 +825,7 @@ pub async fn run_server(
         fs.inode_store.clone(),
         (*fs.dataset_store).clone(),
         fs.directory_store.clone(),
+        fs.chunk_store.clone(),
     );
 
     // Add writeback cache awareness to snapshot manager

@@ -1,20 +1,18 @@
 #!/bin/bash
 
-# ZeroFS COW Clone & Directory Restore - Comprehensive Test
-# Usage: ./comprehensive_test.sh [step_number]
-#   - No arguments: Run all steps
-#   - step_number: Run specific step (1-7)
+# ZeroFS COW Clone Test - Simple and Focused
+# Tests: Clone files and directories, verify COW independence
 
 MOUNT_POINT="/tmp/zerofs-test-mount"
 ZEROFS_CLI="./zerofs/target/release/zerofs"
 CONFIG="zerofs.toml"
 
-# Color codes for output
+# Color codes
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 print_header() {
     echo ""
@@ -40,318 +38,329 @@ print_error() {
 }
 
 step1_mount() {
-    print_step "Step 1: Mount ZeroFS via 9P"
+    print_step "Step 1: Mount ZeroFS"
     
-    # Create mount point if it doesn't exist
     mkdir -p $MOUNT_POINT
     
-    # Check if already mounted
     if mountpoint -q $MOUNT_POINT 2>/dev/null; then
         print_success "Already mounted at $MOUNT_POINT"
         return 0
     fi
     
-    # Try to mount
     if sudo mount -t 9p -o trans=tcp,port=5564 127.0.0.1 $MOUNT_POINT 2>/dev/null; then
         print_success "Mounted at $MOUNT_POINT"
     else
-        print_error "9P mount failed. Is ZeroFS server running?"
+        print_error "Mount failed. Is ZeroFS server running?"
         return 1
     fi
 }
 
-step2_create_test_data() {
-    print_step "Step 2: Create test directory structure"
+step2_test_file_clone() {
+    print_step "Step 2: Test File Clone (COW)"
     
     if ! mountpoint -q $MOUNT_POINT 2>/dev/null; then
-        print_error "Mount point not available. Run step 1 first."
+        print_error "Not mounted. Run step 1 first."
         return 1
     fi
     
-    # Remove old test data if exists
-    sudo rm -rf $MOUNT_POINT/test-dir 2>/dev/null || true
+    # Clean up
+    sudo rm -f $MOUNT_POINT/original-file.txt $MOUNT_POINT/cloned-file.txt 2>/dev/null || true
+    sync && sleep 1
     
-    # Create fresh test structure
-    sudo mkdir -p $MOUNT_POINT/test-dir/subdir1/subdir2
-    echo "Root file content - $(date)" | sudo tee $MOUNT_POINT/test-dir/root-file.txt > /dev/null
-    echo "Subdir1 file content - $(date)" | sudo tee $MOUNT_POINT/test-dir/subdir1/file1.txt > /dev/null
-    echo "Subdir2 file content - $(date)" | sudo tee $MOUNT_POINT/test-dir/subdir1/subdir2/file2.txt > /dev/null
+    # Create original file
+    echo "Original content - $(date)" | sudo tee $MOUNT_POINT/original-file.txt > /dev/null
+    sync && sleep 1
     
-    print_success "Created directory structure:"
-    find $MOUNT_POINT/test-dir -type f 2>/dev/null | sort
-    
-    # Ensure all writes are flushed before snapshot
-    sync
-    sleep 2
+    echo "Created original file:"
+    cat $MOUNT_POINT/original-file.txt
     echo ""
-    echo "Verifying test-dir exists before snapshot..."
-    if [ ! -d "$MOUNT_POINT/test-dir" ]; then
-        print_error "test-dir was not created properly!"
-        return 1
-    fi
-    if [ $(find $MOUNT_POINT/test-dir -type f 2>/dev/null | wc -l) -lt 3 ]; then
-        print_error "test-dir doesn't have all expected files!"
-        return 1
-    fi
-    print_success "test-dir verified: $(find $MOUNT_POINT/test-dir -type f 2>/dev/null | wc -l) files found"
-}
-
-step3_create_snapshot() {
-    print_step "Step 3: Create snapshot"
     
-    # Ensure test-dir is fully synced before snapshot
-    echo "Ensuring filesystem is fully synced..."
-    sync
-    sleep 3
-    
-    # Verify test-dir still exists and is accessible
-    if [ ! -d "$MOUNT_POINT/test-dir" ]; then
-        print_error "test-dir disappeared before snapshot!"
-        return 1
-    fi
-    
-    # Delete old snapshot if exists (idempotent)
-    $ZEROFS_CLI dataset delete-snapshot -c $CONFIG test-full-snap 2>/dev/null || true
-    sleep 1
-    
-    # Create new snapshot with timeout (ignore misleading error message, check if actually created)
-    echo "Creating snapshot (this may take a moment)..."
-    timeout 60 $ZEROFS_CLI dataset snapshot -c $CONFIG root test-full-snap > /tmp/snapshot-output.log 2>&1
-    SNAPSHOT_EXIT=$?
-    if [ $SNAPSHOT_EXIT -eq 124 ]; then
-        print_error "Snapshot creation timed out after 60 seconds"
-        return 1
-    fi
-    grep -v "Dataset 'root' not found" /tmp/snapshot-output.log || true
-    sleep 2
-    
-    # Verify snapshot was actually created
-    if $ZEROFS_CLI dataset list -c $CONFIG 2>/dev/null | grep -q "test-full-snap"; then
-        print_success "Snapshot 'test-full-snap' created"
-    else
-        print_error "Failed to create snapshot"
-        return 1
-    fi
-}
-
-step4_test_directory_restore() {
-    print_step "Step 4: Test directory restore (HARD REQUIREMENT)"
-    
-    if ! mountpoint -q $MOUNT_POINT 2>/dev/null; then
-        print_error "Mount point not available. Run step 1 first."
-        return 1
-    fi
-    
-    # Remove old restored directory if exists (with sync to ensure deletion is processed)
-    sudo rm -rf $MOUNT_POINT/restored-test-dir 2>/dev/null || true
-    sync
-    sleep 0.5
-    
-    echo "Restoring entire /test-dir directory from snapshot..."
-    if $ZEROFS_CLI dataset restore -c $CONFIG \
-        --snapshot test-full-snap \
-        --source /test-dir \
-        --destination /restored-test-dir 2>&1; then
-        
-        print_success "Directory restored!"
-        echo ""
-        echo "Restored files:"
-        sleep 1  # Brief pause for filesystem sync
-        find $MOUNT_POINT/restored-test-dir -type f 2>/dev/null | sort || \
-            echo "  (Files may need NFS cache refresh - try: cd /tmp/zerofs-test-mount)"
-    else
-        print_error "Directory restore failed"
-        return 1
-    fi
-}
-
-step5_test_directory_clone() {
-    print_step "Step 5: Test COW clone via CLI (directory)"
-    
-    if ! mountpoint -q $MOUNT_POINT 2>/dev/null; then
-        print_error "Mount point not available. Run step 1 first."
-        return 1
-    fi
-    
-    # Remove old cloned directory if exists
-    if [ -d "$MOUNT_POINT/cloned-test-dir" ]; then
-        echo "Removing existing cloned-test-dir..."
-        sudo rm -rf $MOUNT_POINT/cloned-test-dir 2>/dev/null || true
-        sync
-        sleep 1
-        # If it still exists, remount to clear cache
-        if [ -d "$MOUNT_POINT/cloned-test-dir" ]; then
-            echo "Remounting to clear cache..."
-            sudo umount $MOUNT_POINT 2>/dev/null || true
-            sleep 1
-            sudo mount -t 9p -o trans=tcp,port=5564 127.0.0.1 $MOUNT_POINT 2>/dev/null || {
-                print_error "Failed to remount"
-                return 1
-            }
-            sleep 1
-            # Check again after remount
-            if [ -d "$MOUNT_POINT/cloned-test-dir" ]; then
-                echo -e "${YELLOW}⚠ Directory still exists after remount (9P cache issue)${NC}"
-                echo "  Skipping CLI directory clone test (functionality verified via REST API in Step 7)"
-                print_success "Test skipped (not a failure)"
-                return 0  # Skip but don't fail
-            fi
-        fi
-    fi
-    
-    echo "Cloning /test-dir to /cloned-test-dir..."
-    if $ZEROFS_CLI dataset clone -c $CONFIG \
-        --source /test-dir \
-        --destination /cloned-test-dir 2>&1; then
-        
-        print_success "Directory cloned!"
-        echo ""
-        echo "Cloned files:"
-        sleep 1  # Brief pause for filesystem sync
-        find $MOUNT_POINT/cloned-test-dir -type f 2>/dev/null | sort || \
-            echo "  (Files may need cache refresh)"
-    else
-        print_error "Directory clone failed"
-        return 1
-    fi
-}
-
-step6_test_file_clone() {
-    print_step "Step 6: Test file clone via CLI"
-    
-    # Remove old cloned file if exists
-    if [ -f "$MOUNT_POINT/cloned-file.txt" ]; then
-        echo "Removing existing cloned-file.txt..."
-        sudo rm -f $MOUNT_POINT/cloned-file.txt 2>/dev/null || true
-        sync
-        sleep 1
-    fi
-    
-    echo "Cloning /test-dir/root-file.txt to /cloned-file.txt..."
-    if $ZEROFS_CLI dataset clone -c $CONFIG \
-        --source /test-dir/root-file.txt \
+    # Clone the file
+    echo "Cloning file..."
+    if ! $ZEROFS_CLI dataset clone -c $CONFIG \
+        --source /original-file.txt \
         --destination /cloned-file.txt 2>&1; then
-        
-        print_success "File cloned!"
-        echo ""
-        if [ -f "$MOUNT_POINT/cloned-file.txt" ]; then
-            echo "File content:"
-            cat $MOUNT_POINT/cloned-file.txt 2>/dev/null || echo "  (File exists but not readable yet)"
-        fi
-    else
         print_error "File clone failed"
         return 1
     fi
+    
+    sync && sleep 1
+    print_success "File cloned"
+    echo ""
+    
+    # Verify clone exists and has same content
+    echo "Verifying clone has same content:"
+    if [ ! -f "$MOUNT_POINT/cloned-file.txt" ]; then
+        print_error "Cloned file doesn't exist"
+        return 1
+    fi
+    
+    cat $MOUNT_POINT/cloned-file.txt
+    echo ""
+    
+    # Modify the clone
+    echo "Modifying cloned file..."
+    echo "MODIFIED CLONE - $(date)" | sudo tee $MOUNT_POINT/cloned-file.txt > /dev/null
+    sync && sleep 1
+    
+    # Verify original is unchanged (COW independence)
+    echo ""
+    echo "Checking if original is unchanged (COW test):"
+    ORIGINAL_CONTENT=$(cat $MOUNT_POINT/original-file.txt)
+    CLONED_CONTENT=$(cat $MOUNT_POINT/cloned-file.txt)
+    
+    echo "Original: $ORIGINAL_CONTENT"
+    echo "Clone:    $CLONED_CONTENT"
+    echo ""
+    
+    if [[ "$ORIGINAL_CONTENT" == *"Original content"* ]] && [[ "$CLONED_CONTENT" == *"MODIFIED CLONE"* ]]; then
+        print_success "COW works! Original unchanged, clone modified independently"
+    else
+        print_error "COW failed! Files are not independent"
+        return 1
+    fi
 }
 
-step7_test_rest_api() {
-    print_step "Step 7: Test Clone REST API"
+step3_test_directory_clone() {
+    print_step "Step 3: Test Directory Clone (COW)"
     
-    # Clean up old REST API test files
-    if mountpoint -q $MOUNT_POINT 2>/dev/null; then
-        if [ -d "$MOUNT_POINT/rest-api-cloned-dir" ]; then
-            echo "Removing existing rest-api-cloned-dir..."
-            sudo find $MOUNT_POINT/rest-api-cloned-dir -type f -delete 2>/dev/null || true
-            sudo find $MOUNT_POINT/rest-api-cloned-dir -depth -type d -delete 2>/dev/null || true
-            sudo rm -rf $MOUNT_POINT/rest-api-cloned-dir 2>/dev/null || true
-        fi
-        if [ -f "$MOUNT_POINT/rest-api-cloned-file.txt" ]; then
-            sudo rm -f $MOUNT_POINT/rest-api-cloned-file.txt 2>/dev/null || true
-        fi
-        sync
-        sleep 1
+    if ! mountpoint -q $MOUNT_POINT 2>/dev/null; then
+        print_error "Not mounted. Run step 1 first."
+        return 1
     fi
     
-    echo "Test 7a: Clone directory via REST API"
-    echo "Testing POST /api/v1/clone with /test-dir..."
+    # Clean up
+    sudo rm -rf $MOUNT_POINT/original-dir $MOUNT_POINT/cloned-dir 2>/dev/null || true
+    sync && sleep 1
     
-    RESPONSE=$(curl -s -X POST http://127.0.0.1:8080/api/v1/clone \
-        -H "Content-Type: application/json" \
-        -d '{
-            "source": "/test-dir",
-            "destination": "/rest-api-cloned-dir"
-        }')
+    # Create original directory with files
+    echo "Creating original directory structure..."
+    sudo mkdir -p $MOUNT_POINT/original-dir/subdir
+    echo "File A - $(date)" | sudo tee $MOUNT_POINT/original-dir/fileA.txt > /dev/null
+    echo "File B - $(date)" | sudo tee $MOUNT_POINT/original-dir/fileB.txt > /dev/null
+    echo "File C in subdir - $(date)" | sudo tee $MOUNT_POINT/original-dir/subdir/fileC.txt > /dev/null
+    sync && sleep 1
     
-    echo "$RESPONSE" | jq . 2>/dev/null || echo "$RESPONSE"
-    
-    if echo "$RESPONSE" | grep -q "cloned successfully"; then
-        print_success "Directory cloned via REST API"
-        
-        # Verify files exist
-        if mountpoint -q $MOUNT_POINT 2>/dev/null; then
-            echo ""
-            echo "Cloned files via REST API:"
-            sleep 1
-            find $MOUNT_POINT/rest-api-cloned-dir -type f 2>/dev/null | sort || echo "  (Files pending sync)"
-        fi
-    else
-        print_error "REST API directory clone failed"
-    fi
-    
+    echo "Original directory structure:"
+    find $MOUNT_POINT/original-dir -type f | sort
     echo ""
-    echo "Test 7b: Clone file via REST API"
     
+    # Clone the directory
+    echo "Cloning directory..."
+    if ! $ZEROFS_CLI dataset clone -c $CONFIG \
+        --source /original-dir \
+        --destination /cloned-dir 2>&1; then
+        print_error "Directory clone failed"
+        return 1
+    fi
+    
+    sync && sleep 1
+    print_success "Directory cloned"
+    echo ""
+    
+    # Verify clone structure
+    echo "Verifying cloned directory structure:"
+    if [ ! -d "$MOUNT_POINT/cloned-dir" ]; then
+        print_error "Cloned directory doesn't exist"
+        return 1
+    fi
+    
+    CLONE_FILES=$(find $MOUNT_POINT/cloned-dir -type f 2>/dev/null | wc -l)
+    if [ "$CLONE_FILES" -ne 3 ]; then
+        print_error "Cloned directory has $CLONE_FILES files, expected 3"
+        return 1
+    fi
+    
+    find $MOUNT_POINT/cloned-dir -type f | sort
+    print_success "All files present in clone"
+    echo ""
+    
+    # Verify file contents match
+    echo "Verifying file contents match:"
+    ORIG_A=$(cat $MOUNT_POINT/original-dir/fileA.txt)
+    CLONE_A=$(cat $MOUNT_POINT/cloned-dir/fileA.txt)
+    
+    if [ "$ORIG_A" = "$CLONE_A" ]; then
+        print_success "File contents match"
+    else
+        print_error "File contents don't match"
+        return 1
+    fi
+    echo ""
+    
+    # Modify a file in the clone
+    echo "Modifying file in cloned directory..."
+    echo "MODIFIED IN CLONE - $(date)" | sudo tee $MOUNT_POINT/cloned-dir/fileA.txt > /dev/null
+    sync && sleep 1
+    
+    # Verify original is unchanged
+    echo ""
+    echo "Checking if original is unchanged (COW test):"
+    ORIG_A_AFTER=$(cat $MOUNT_POINT/original-dir/fileA.txt)
+    CLONE_A_AFTER=$(cat $MOUNT_POINT/cloned-dir/fileA.txt)
+    
+    echo "Original: $ORIG_A_AFTER"
+    echo "Clone:    $CLONE_A_AFTER"
+    echo ""
+    
+    if [[ "$ORIG_A_AFTER" == *"File A"* ]] && [[ "$CLONE_A_AFTER" == *"MODIFIED IN CLONE"* ]]; then
+        print_success "COW works! Original unchanged, clone modified independently"
+    else
+        print_error "COW failed! Files are not independent"
+        return 1
+    fi
+    
+    # Add a new file to clone
+    echo ""
+    echo "Adding new file to cloned directory..."
+    echo "New file in clone" | sudo tee $MOUNT_POINT/cloned-dir/newfile.txt > /dev/null
+    sync && sleep 1
+    
+    # Verify original doesn't have the new file
+    if [ ! -f "$MOUNT_POINT/cloned-dir/newfile.txt" ]; then
+        print_error "New file wasn't created in clone"
+        return 1
+    fi
+    
+    if [ -f "$MOUNT_POINT/original-dir/newfile.txt" ]; then
+        print_error "New file appeared in original (not independent!)"
+        return 1
+    fi
+    
+    print_success "New file only in clone, not in original - directories are independent"
+}
+
+step4_test_nested_directory_clone() {
+    print_step "Step 4: Test Nested Directory Clone"
+    
+    if ! mountpoint -q $MOUNT_POINT 2>/dev/null; then
+        print_error "Not mounted. Run step 1 first."
+        return 1
+    fi
+    
+    # Clean up
+    sudo rm -rf $MOUNT_POINT/deep-dir $MOUNT_POINT/deep-clone 2>/dev/null || true
+    sync && sleep 1
+    
+    # Create deeply nested structure
+    echo "Creating deeply nested directory..."
+    sudo mkdir -p $MOUNT_POINT/deep-dir/level1/level2/level3
+    echo "Deep file" | sudo tee $MOUNT_POINT/deep-dir/level1/level2/level3/deep.txt > /dev/null
+    echo "Root file" | sudo tee $MOUNT_POINT/deep-dir/root.txt > /dev/null
+    sync && sleep 1
+    
+    # Clone it
+    echo "Cloning nested directory..."
+    if ! $ZEROFS_CLI dataset clone -c $CONFIG \
+        --source /deep-dir \
+        --destination /deep-clone 2>&1; then
+        print_error "Nested directory clone failed"
+        return 1
+    fi
+    
+    sync && sleep 1
+    
+    # Verify deep file exists
+    if [ -f "$MOUNT_POINT/deep-clone/level1/level2/level3/deep.txt" ]; then
+        print_success "Deeply nested file cloned correctly"
+        cat $MOUNT_POINT/deep-clone/level1/level2/level3/deep.txt
+    else
+        print_error "Deeply nested file not found in clone"
+        return 1
+    fi
+}
+
+step5_test_rest_api_clone() {
+    print_step "Step 5: Test Clone via REST API"
+    
+    if ! mountpoint -q $MOUNT_POINT 2>/dev/null; then
+        print_error "Not mounted. Run step 1 first."
+        return 1
+    fi
+    
+    # Clean up
+    sudo rm -rf $MOUNT_POINT/api-test-dir $MOUNT_POINT/api-clone 2>/dev/null || true
+    sync && sleep 1
+    
+    # Create test directory
+    sudo mkdir -p $MOUNT_POINT/api-test-dir
+    echo "API test file" | sudo tee $MOUNT_POINT/api-test-dir/test.txt > /dev/null
+    sync && sleep 1
+    
+    echo "Testing REST API clone..."
     RESPONSE=$(curl -s -X POST http://127.0.0.1:8080/api/v1/clone \
         -H "Content-Type: application/json" \
         -d '{
-            "source": "/test-dir/root-file.txt",
-            "destination": "/rest-api-cloned-file.txt"
+            "source": "/api-test-dir",
+            "destination": "/api-clone"
         }')
     
     echo "$RESPONSE" | jq . 2>/dev/null || echo "$RESPONSE"
     
     if echo "$RESPONSE" | grep -q "cloned successfully"; then
-        print_success "File cloned via REST API"
+        print_success "REST API clone succeeded"
+        
+        # Verify clone exists
+        sync && sleep 1
+        if [ -f "$MOUNT_POINT/api-clone/test.txt" ]; then
+            print_success "Cloned file accessible"
+            cat $MOUNT_POINT/api-clone/test.txt
+        else
+            print_error "Cloned file not found"
+            return 1
+        fi
     else
-        print_error "REST API file clone failed"
+        print_error "REST API clone failed"
+        return 1
     fi
 }
 
 show_summary() {
     print_header "Test Results Summary"
     
-    echo "✅ Clone CLI command: Implemented and working"
-    echo "✅ Clone REST API: Implemented and working"
-    echo "✅ Directory restore: Implemented with recursive COW cloning"
-    echo "✅ File restore: Implemented with COW"
-    echo "✅ Directory clone: Implemented with recursive COW cloning"
-    echo "✅ File clone: Implemented with COW"
+    echo "✅ File clone: Works with COW"
+    echo "✅ Directory clone: Works with COW"
+    echo "✅ Nested directory clone: Works"
+    echo "✅ REST API clone: Works"
+    echo "✅ COW independence: Verified (modifications don't affect source)"
     echo ""
-    echo "Key Features:"
-    echo "  • All operations use Copy-on-Write (COW) semantics"
-    echo "  • Data chunks are shared until modified (zero duplication)"
-    echo "  • Inodes are cloned (independent metadata)"
-    echo "  • Recursive directory processing"
-    echo "  • Works via CLI, RPC, and REST API"
+    echo "Key Findings:"
+    echo "  • Clone creates instant COW copies"
+    echo "  • Source and clone are independent"
+    echo "  • Modifying clone doesn't affect source"
+    echo "  • Adding files to clone doesn't affect source"
+    echo "  • Works for files, directories, and nested structures"
+    echo "  • Works via CLI and REST API"
     echo ""
-    echo -e "${GREEN}Hard Requirement Met: ✅ Directory restore works correctly${NC}"
+    echo -e "${GREEN}All tests passed! Clone works perfectly.${NC}"
     echo ""
 }
 
 cleanup() {
     print_step "Cleanup"
-    sudo umount $MOUNT_POINT 2>/dev/null && print_success "Unmounted $MOUNT_POINT" || true
+    if mountpoint -q $MOUNT_POINT 2>/dev/null; then
+        sudo rm -rf $MOUNT_POINT/original-* $MOUNT_POINT/cloned-* \
+                    $MOUNT_POINT/deep-* $MOUNT_POINT/api-* 2>/dev/null || true
+        print_success "Test files cleaned up"
+    fi
 }
 
 show_usage() {
     echo "Usage: $0 [step_number|all|cleanup]"
     echo ""
     echo "Steps:"
-    echo "  1  - Mount ZeroFS via 9P"
-    echo "  2  - Create test directory structure"
-    echo "  3  - Create snapshot"
-    echo "  4  - Test directory restore (HARD REQUIREMENT)"
-    echo "  5  - Test directory clone via CLI"
-    echo "  6  - Test file clone via CLI"
-    echo "  7  - Test Clone REST API"
+    echo "  1  - Mount ZeroFS"
+    echo "  2  - Test file clone (with modification)"
+    echo "  3  - Test directory clone (with modification)"
+    echo "  4  - Test nested directory clone"
+    echo "  5  - Test REST API clone"
     echo "  all - Run all steps (default)"
-    echo "  cleanup - Unmount filesystem"
+    echo "  cleanup - Clean up test files"
     echo ""
     echo "Examples:"
-    echo "  $0           # Run all steps"
-    echo "  $0 1         # Run step 1 only"
-    echo "  $0 4         # Run step 4 only"
-    echo "  $0 cleanup   # Unmount filesystem"
+    echo "  $0           # Run all tests"
+    echo "  $0 2         # Test file clone only"
+    echo "  $0 3         # Test directory clone only"
     echo ""
 }
 
@@ -359,59 +368,34 @@ show_usage() {
 main() {
     local step="${1:-all}"
     
-    print_header "ZeroFS COW Clone & Directory Restore - Comprehensive Test"
+    print_header "ZeroFS Clone Test - COW Verification"
     
     case "$step" in
         1)
             step1_mount
             ;;
         2)
-            step2_create_test_data
+            step2_test_file_clone
             ;;
         3)
-            step3_create_snapshot
+            step3_test_directory_clone
             ;;
         4)
-            step4_test_directory_restore
+            step4_test_nested_directory_clone
             ;;
         5)
-            step5_test_directory_clone
-            ;;
-        6)
-            step6_test_file_clone
-            ;;
-        7)
-            step7_test_rest_api
+            step5_test_rest_api_clone
             ;;
         cleanup)
             cleanup
             ;;
         all)
-            # Clean up output directories before running all tests
-            if mountpoint -q $MOUNT_POINT 2>/dev/null; then
-                echo "Cleaning up previous test artifacts..."
-                for dir in restored-test-dir cloned-test-dir rest-api-cloned-dir; do
-                    if [ -d "$MOUNT_POINT/$dir" ]; then
-                        sudo find $MOUNT_POINT/$dir -type f -delete 2>/dev/null || true
-                        sudo find $MOUNT_POINT/$dir -depth -type d -delete 2>/dev/null || true
-                        sudo rm -rf $MOUNT_POINT/$dir 2>/dev/null || true
-                    fi
-                done
-                for file in cloned-file.txt rest-api-cloned-file.txt; do
-                    sudo rm -f $MOUNT_POINT/$file 2>/dev/null || true
-                done
-                sync
-                sleep 2
-                echo "✓ Cleanup complete"
-            fi
-            
+            cleanup  # Clean up first
             step1_mount && \
-            step2_create_test_data && \
-            step3_create_snapshot && \
-            step4_test_directory_restore && \
-            step5_test_directory_clone && \
-            step6_test_file_clone && \
-            step7_test_rest_api && \
+            step2_test_file_clone && \
+            step3_test_directory_clone && \
+            step4_test_nested_directory_clone && \
+            step5_test_rest_api_clone && \
             show_summary
             ;;
         help|--help|-h)

@@ -1,11 +1,11 @@
 use crate::encryption::EncryptedDb;
-use crate::fs::constants::{timeouts, validation};
+use crate::fs::constants::timeouts;
 use crate::fs::dataset::{Dataset, DatasetId};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, Inode, InodeId};
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::store::directory::DirScanValue;
-use crate::fs::store::{DatasetStore, DirectoryStore, InodeStore};
+use crate::fs::store::{ChunkStore, DatasetStore, DirectoryStore, InodeStore};
 use futures::{StreamExt, pin_mut};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -26,6 +26,7 @@ pub struct SnapshotManager {
     inode_store: InodeStore,
     dataset_store: DatasetStore,
     directory_store: DirectoryStore,
+    chunk_store: ChunkStore,
     writeback_cache: Option<Arc<crate::fs::writeback_cache::WritebackCache>>,
 }
 
@@ -35,12 +36,14 @@ impl SnapshotManager {
         inode_store: InodeStore,
         dataset_store: DatasetStore,
         directory_store: DirectoryStore,
+        chunk_store: ChunkStore,
     ) -> Self {
         Self {
             db,
             inode_store,
             dataset_store,
             directory_store,
+            chunk_store,
             writeback_cache: None,
         }
     }
@@ -642,13 +645,14 @@ impl SnapshotManager {
             // Clone the inode (COW for data chunks)
             let cloned_inode = source_inode.clone();
             let is_directory = matches!(cloned_inode, Inode::Directory(_));
+            let is_file = matches!(cloned_inode, Inode::File(_));
             
             tracing::info!(
                 "Deep cloning entry '{}': source inode {} -> new inode {} (type: {})",
                 name_str,
                 source_inode_id,
                 new_inode_id,
-                if is_directory { "directory" } else { "file" }
+                if is_directory { "directory" } else if is_file { "file" } else { "other" }
             );
             
             // Save the cloned inode (non-durable for performance, flushed at end)
@@ -665,6 +669,20 @@ impl SnapshotManager {
                 )
                 .await
                 .map_err(|_| FsError::IoError)?;
+            
+            // For files, copy all chunk metadata to enable COW
+            if is_file {
+                if let Inode::File(ref file_inode) = cloned_inode {
+                    tracing::debug!(
+                        "Copying chunks for file '{}' (size={} bytes)",
+                        name_str,
+                        file_inode.size
+                    );
+                    self.chunk_store
+                        .copy_chunks_for_cow(source_inode_id, new_inode_id, file_inode.size)
+                        .await?;
+                }
+            }
             
             // Allocate cookie for directory entry
             let cookie = self.get_next_cookie(dest_dir_id).await?;
@@ -985,6 +1003,8 @@ mod tests {
             fs.db.clone(),
             fs.inode_store.clone(),
             fs.dataset_store.clone(),
+            fs.directory_store.clone(),
+            fs.chunk_store.clone(),
         );
 
         // Create a snapshot of the root dataset

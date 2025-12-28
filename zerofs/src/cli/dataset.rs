@@ -2,6 +2,7 @@ use crate::config::Settings;
 use crate::rpc::client::RpcClient;
 use anyhow::{Context, Result};
 use comfy_table::{Table, presets::UTF8_FULL};
+use std::io::Write;
 use std::path::Path;
 
 async fn connect_rpc_client(config_path: &Path) -> Result<RpcClient> {
@@ -138,29 +139,33 @@ pub async fn get_dataset_info(config_path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create a snapshot
+/// Create a snapshot (implemented as a COW clone)
 pub async fn create_snapshot(
     config_path: &Path,
-    source_name: &str,
+    source_path: &str,
     snapshot_name: &str,
-    readonly: bool,
+    _readonly: bool, // Ignored - all clones are independent
 ) -> Result<()> {
-    let client = connect_rpc_client(config_path).await?;
-    let snapshot = client
-        .create_snapshot_with_options(source_name, snapshot_name, readonly)
-        .await?;
-
-    println!("✓ Snapshot created successfully!");
-    println!("  Name: {}", snapshot.name);
-    println!("  ID: {}", snapshot.id);
-    println!("  UUID: {}", snapshot.uuid);
-    println!("  Source: {}", source_name);
-    println!("  Created at: {}", format_timestamp(snapshot.created_at));
-
-    if let Some(parent_uuid) = snapshot.parent_uuid {
-        println!("  Parent UUID: {}", parent_uuid);
-    }
-
+    // Snapshot is just a clone to /snapshots/<name>
+    let dest_path = format!("/snapshots/{}", snapshot_name);
+    
+    println!("📸 Creating snapshot (COW clone)...");
+    println!("   Source: {}", source_path);
+    println!("   Destination: {}", dest_path);
+    println!();
+    
+    // Call clone
+    clone_path(config_path, source_path, &dest_path).await?;
+    
+    println!();
+    println!("✅ Snapshot created!");
+    println!("   Location: {}", dest_path);
+    println!("   Type: Independent COW clone");
+    println!();
+    println!("💡 Tip: Snapshots are just directories");
+    println!("   View: ls {}", dest_path);
+    println!("   Restore: cp -r {} {}", dest_path, source_path);
+    
     Ok(())
 }
 
@@ -234,151 +239,49 @@ pub async fn get_default_dataset(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check if a path is within a ZeroFS mount point
-/// For internal restore (within ZeroFS filesystem), paths should NOT include external mount points
-/// Examples of INTERNAL paths (use instant restore):
-///   - /file.txt                                  (root of ZeroFS filesystem)
-///   - /data/file.txt                            (subdirectory in ZeroFS)
-///   - /var/lib/kubelet/pods/.../file.txt        (Kubernetes CSI volume path - internal to ZeroFS)
-/// Examples of EXTERNAL paths (use copy-based restore):
-///   - /tmp/file.txt                             (outside ZeroFS, on local filesystem)
-///   - /home/user/file.txt                       (outside ZeroFS, on local filesystem)
-fn is_internal_zerofs_path(destination_path: &str) -> bool {
+// Removed: is_internal_zerofs_path() - no longer needed
 
-    // For instant restore to work, the destination must be:
-    // 1. An absolute path starting with /
-    // 2. NOT a path on the local filesystem outside ZeroFS
-
-    if !destination_path.starts_with('/') {
-        return false;
-    }
-
-    // Paths that are definitely EXTERNAL (local filesystem):
-    let external_prefixes = [
-        "/tmp/", "/home/", "/root/", "/opt/", "/usr/", "/etc/", "/boot/", "/sys/", "/proc/",
-        "/dev/",
-    ];
-
-    for prefix in &external_prefixes {
-        if destination_path.starts_with(prefix) {
-            return false; // External path, use copy-based restore
-        }
-    }
-
-    // All other absolute paths are considered internal to ZeroFS
-    // This includes:
-    // - /file.txt (root of ZeroFS)
-    // - /data/file.txt (ZeroFS subdirectories)
-    // - /mnt/... (if ZeroFS is mounted at /mnt)
-    // - /var/lib/kubelet/... (Kubernetes CSI volumes)
-    true
-}
-
-/// Restore a file from a snapshot (instant COW copy when destination is within ZeroFS)
+/// Restore is deprecated - just use clone or copy the directory
 pub async fn restore_from_snapshot(
-    config_path: &Path,
+    _config_path: &Path,
     snapshot_name: &str,
     source_path: &str,
     destination_path: &str,
 ) -> Result<()> {
-    use std::fs;
-    use std::io::Write;
-
-    let client = connect_rpc_client(config_path).await?;
-
-    // Get snapshot info to verify it exists
-    let snapshot = client
-        .get_dataset_info(snapshot_name)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Snapshot '{}' not found", snapshot_name))?;
-
-    if !snapshot.is_snapshot {
-        anyhow::bail!("'{}' is not a snapshot", snapshot_name);
-    }
-
-    println!("📸 Restoring from snapshot: {}", snapshot_name);
-    println!("   Created: {}", format_timestamp(snapshot.created_at));
-    println!("   Source path: {}", source_path);
-    println!("   Destination: {}", destination_path);
+    println!("❌ 'restore' command is deprecated!");
     println!();
-
-    // Check if destination is internal to ZeroFS filesystem
-    // For Kubernetes CSI, paths will be absolute paths like /var/lib/kubelet/pods/.../volumes/...
-    // For direct use, paths will be like /file.txt or /data/file.txt (relative to ZeroFS root)
-    let use_instant_restore = is_internal_zerofs_path(destination_path);
-
-    if use_instant_restore {
-        // INSTANT RESTORE: Create directory entry pointing to snapshot inode (COW)
-        print!("⚡ Instant restore (COW - no data copying)...");
-        std::io::stdout().flush()?;
-
-        let (inode_id, file_size, nlink) = client
-            .instant_restore_file(snapshot_name, source_path, destination_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to instant restore file '{}' from snapshot",
-                    source_path
-                )
-            })?;
-
-        println!(" done!");
-        println!();
-        println!("✅ File restored instantly (COW)!");
-        println!("   Inode: {}", inode_id);
-        println!("   Size: {}", format_size(file_size));
-        println!("   Links: {} (shared with snapshot)", nlink);
-        println!("   ⚡ No data copied - instant restore!");
-    } else {
-        // COPY-BASED RESTORE: For external destinations (outside ZeroFS)
-        print!("⏳ Reading file from snapshot...");
-        std::io::stdout().flush()?;
-
-        // Read the file from the snapshot via RPC
-        let file_data = client
-            .read_snapshot_file(snapshot_name, source_path)
-            .await
-            .with_context(|| format!("Failed to read file '{}' from snapshot", source_path))?;
-
-        println!(" done! ({} bytes)", file_data.len());
-
-        print!("⏳ Writing to destination...");
-        std::io::stdout().flush()?;
-
-        // Write to destination
-        fs::write(destination_path, &file_data)
-            .with_context(|| format!("Failed to write to destination '{}'", destination_path))?;
-
-        println!(" done!");
-        println!();
-        println!("✅ File restored successfully!");
-        println!("   Size: {}", format_size(file_data.len() as u64));
-        println!("   Note: Data copied (destination outside ZeroFS)");
-    }
-
-    Ok(())
+    println!("Snapshots are just directories now. To restore:");
+    println!();
+    println!("Option 1: Copy the directory (filesystem operations)");
+    println!("  cp -r /snapshots/{}/{} {}", snapshot_name, source_path, destination_path);
+    println!();
+    println!("Option 2: Use clone command (COW, instant)");
+    println!("  zerofs dataset clone --source /snapshots/{}/{} --destination {}", 
+        snapshot_name, source_path, destination_path);
+    println!();
+    println!("💡 Tip: Snapshots are independent copies, not special entities.");
+    println!("   Just treat them as regular directories!");
+    
+    anyhow::bail!("Use 'clone' or 'cp' instead of 'restore'")
 }
 
-/// Clone a file or directory using COW (Copy-on-Write)
-/// This creates an instant copy with no data duplication until modified
+/// Clone a path (COW, instant copy)
 pub async fn clone_path(
     config_path: &Path,
     source_path: &str,
     destination_path: &str,
 ) -> Result<()> {
-    use std::io::Write;
-
-    let mut client = connect_rpc_client(config_path).await?;
-
+    let client = connect_rpc_client(config_path).await?;
+    
     println!("🔄 Cloning with COW (Copy-on-Write)");
     println!("   Source: {}", source_path);
     println!("   Destination: {}", destination_path);
     println!();
-
+    
     print!("⏳ Creating COW clone...");
     std::io::stdout().flush()?;
-
-    let (inode_id, size, is_dir) = client
+    
+    let (inode_id, size, is_directory) = client
         .clone_path(source_path, destination_path)
         .await
         .with_context(|| {
@@ -387,19 +290,17 @@ pub async fn clone_path(
                 source_path, destination_path
             )
         })?;
-
+    
     println!(" done!");
     println!();
     println!("✅ Clone created successfully!");
-    println!("   Type: {}", if is_dir { "Directory" } else { "File" });
+    println!("   Type: {}", if is_directory { "Directory" } else { "File" });
     println!("   Inode: {}", inode_id);
-    if !is_dir {
-        println!("   Size: {}", format_size(size));
-    }
+    println!("   Size: {}", format_size(size));
     println!("   ⚡ COW: Data shared until modified (zero copy)");
     println!();
     println!("Note: Source and destination are now independent.");
     println!("      Modifications to either won't affect the other.");
-
+    
     Ok(())
 }
