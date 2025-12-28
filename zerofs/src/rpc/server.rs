@@ -90,17 +90,8 @@ impl AdminRpcServer {
                 continue;
             }
 
-            // Skip corrupted inode IDs (legacy format corruption)
-            // Valid inode IDs should be reasonable (< 100,000)
-            if entry.inode_id > 100_000 {
-                tracing::warn!(
-                    "Skipping entry '{}' with corrupted inode ID {} (0x{:X}) during restore",
-                    name,
-                    entry.inode_id,
-                    entry.inode_id
-                );
-                continue;
-            }
+            // Note: Inode ID validation is now centralized in directory.rs::decode_dir_scan_value()
+            // Corrupted entries are rejected at read time and never reach this code
 
             tracing::debug!(
                 "Cloning entry '{}' (inode {}) from snapshot",

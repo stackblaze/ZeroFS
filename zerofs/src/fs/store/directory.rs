@@ -57,11 +57,13 @@ fn encode_dir_scan_value(name: &[u8], value: &DirScanValue) -> Bytes {
 
 /// Decode directory scan entry value: returns (name, DirScanValue)
 fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsError> {
+    use crate::fs::constants::validation;
+
     // Try new format first (name_len u32 + name + DirScanValue)
     if data.len() >= 4 {
-    let name_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        let name_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
         if data.len() >= 4 + name_len {
-    let name = data[4..4 + name_len].to_vec();
+            let name = data[4..4 + name_len].to_vec();
             let value_data = &data[4 + name_len..];
 
             // Try to deserialize as DirScanValue enum
@@ -72,21 +74,13 @@ fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsError
     }
 
     // Fall back to legacy format (inode_id u64 + name)
-    // BUT: Be strict about what we accept as legacy format to avoid misinterpreting corrupted data
+    // Be strict about validation to prevent corrupted data from being misinterpreted
     if data.len() >= 8 {
         let inode_id = u64::from_le_bytes(data[..8].try_into().unwrap());
         let name = data[8..].to_vec();
         
-        // Validate that this looks like a real legacy entry:
-        // 1. Inode ID should be reasonable (< 100,000 for normal inodes)
-        //    OR a known virtual inode (SNAPSHOTS_ROOT_INODE = 0xFFFFFFFF00000001)
-        // 2. Name should be valid UTF-8 or at least printable
-        // 3. Name should not be empty
-        
-        let is_valid_inode = inode_id < 100_000 || inode_id == 0xFFFFFFFF00000001;
-        let is_valid_name = !name.is_empty() && name.len() < 256; // Reasonable filename length
-        
-        if !is_valid_inode || !is_valid_name {
+        // Validate using centralized validation functions
+        if !validation::is_valid_inode_id(inode_id) || !validation::is_valid_filename(&name) {
             warn!(
                 "Rejecting invalid legacy format entry: inode_id={} (0x{:X}), name_len={}, name={}",
                 inode_id,

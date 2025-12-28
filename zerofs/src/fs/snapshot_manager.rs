@@ -1,4 +1,5 @@
 use crate::encryption::EncryptedDb;
+use crate::fs::constants::{timeouts, validation};
 use crate::fs::dataset::{Dataset, DatasetId};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, Inode, InodeId};
@@ -16,8 +17,8 @@ fn get_current_time() -> (u64, u32) {
     (now.as_secs(), now.subsec_nanos())
 }
 
-/// Inode ID for the /snapshots directory (reserved)
-pub const SNAPSHOTS_ROOT_INODE: InodeId = 0xFFFFFFFF00000001;
+// Re-export SNAPSHOTS_ROOT_INODE from constants module for backwards compatibility
+pub use crate::fs::constants::special_inodes::SNAPSHOTS_ROOT_INODE;
 
 /// Manager for creating and managing Copy-on-Write (COW) snapshots
 pub struct SnapshotManager {
@@ -392,7 +393,7 @@ impl SnapshotManager {
         // Use a timeout to prevent hanging on large datasets
         tracing::info!("Flushing database before listing directory entries...");
         match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            timeouts::CACHE_FLUSH_TIMEOUT,
             self.db.flush()
         ).await {
             Ok(Ok(_)) => {
@@ -402,7 +403,10 @@ impl SnapshotManager {
                 tracing::warn!("Database flush failed: {:?}, continuing anyway", e);
             }
             Err(_) => {
-                tracing::warn!("Database flush timed out after 10 seconds, continuing anyway");
+                tracing::warn!(
+                    "Database flush timed out after {:?}, continuing anyway",
+                    timeouts::CACHE_FLUSH_TIMEOUT
+                );
             }
         }
 
@@ -481,18 +485,24 @@ impl SnapshotManager {
         // Flush to ensure all entries are persisted (with timeout to prevent hanging)
         tracing::info!("Flushing database to ensure snapshot durability...");
         match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            timeouts::DB_FLUSH_TIMEOUT,
             self.db.flush()
         ).await {
             Ok(Ok(_)) => {
                 tracing::info!("Database flushed successfully");
             }
             Ok(Err(e)) => {
-                tracing::warn!("Database flush failed: {:?}, but snapshot creation will continue", e);
+                tracing::warn!(
+                    "Database flush failed: {:?}, but snapshot creation will continue", 
+                    e
+                );
                 // Continue anyway - snapshot is created, just not guaranteed durable yet
             }
             Err(_) => {
-                tracing::warn!("Database flush timed out after 30 seconds, but snapshot creation will continue");
+                tracing::warn!(
+                    "Database flush timed out after {:?}, but snapshot creation will continue",
+                    timeouts::DB_FLUSH_TIMEOUT
+                );
                 // Continue anyway - snapshot is created, just not guaranteed durable yet
             }
         }
@@ -602,19 +612,8 @@ impl SnapshotManager {
                 continue;
             }
             
-            // Skip corrupted inode IDs (legacy format corruption)
-            // Valid inode IDs should be reasonable (< 100,000)
-            // Corrupted IDs are typically 0xFFFFFFFF + offset or similar large values
-            if source_inode_id > 100_000 {
-                tracing::warn!(
-                    "Skipping entry '{}' with corrupted inode ID {} (0x{:X}) during snapshot",
-                    name_str,
-                    source_inode_id,
-                    source_inode_id
-                );
-                skipped_count += 1;
-                continue;
-            }
+            // Note: Inode ID validation is now centralized in directory.rs::decode_dir_scan_value()
+            // Corrupted entries are rejected at read time and never reach this code
             
             tracing::debug!(
                 "Processing entry '{}' (inode {}) for deep clone",
