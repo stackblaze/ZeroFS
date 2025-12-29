@@ -414,6 +414,26 @@ impl AdminService for AdminRpcServer {
             .await
             .map_err(|e| Status::internal(format!("Failed to commit: {}", e)))?;
 
+        // For files, copy chunk metadata (COW)
+        if !is_directory && size > 0 {
+            tracing::info!(
+                "Copying chunks from source inode {} to cloned inode {} (file_size={})",
+                current_inode,
+                new_inode_id,
+                size
+            );
+            fs_ref
+                .chunk_store
+                .copy_chunks_for_cow(current_inode, new_inode_id, size)
+                .await
+                .map_err(|e| Status::internal(format!("Failed to copy chunks: {}", e)))?;
+            
+            // Flush to ensure chunks are persisted
+            if let Err(e) = fs_ref.db.flush().await {
+                tracing::warn!("Failed to flush after file clone: {}", e);
+            }
+        }
+
         // If it's a directory, recursively clone its contents
         if is_directory {
             tracing::info!(
