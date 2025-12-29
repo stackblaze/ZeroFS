@@ -23,7 +23,7 @@ fn encode_dir_scan_value(name: &[u8], value: &DirScanValue) -> Bytes {
 
 /// Deep clone directory and all its contents recursively
 /// This creates new inodes for all files and subdirectories
-/// Data chunks are shared via CAS (COW) but inodes are independent
+/// Data chunks are copied via copy_chunks_for_cow for true COW
 pub async fn clone_directory_deep(
     db: Arc<EncryptedDb>,
     inode_store: &InodeStore,
@@ -82,9 +82,14 @@ pub async fn clone_directory_deep(
         // Allocate new inode ID for the clone
         let new_inode_id = inode_store.allocate();
         
-        // Clone the inode (COW for data chunks via CAS)
+        // Clone the inode
         let cloned_inode = source_inode.clone();
         let is_directory = matches!(cloned_inode, Inode::Directory(_));
+        let file_size = if let Inode::File(ref file) = cloned_inode {
+            file.size
+        } else {
+            0
+        };
         
         // Save the cloned inode
         let inode_key = KeyCodec::inode_key(new_inode_id);
@@ -100,9 +105,10 @@ pub async fn clone_directory_deep(
         .await
         .map_err(|_| FsError::IoError)?;
         
-        // Note: With CAS, files automatically share chunks via hash references
-        // No need to copy chunk metadata - the cloned inode's chunks vector
-        // already points to the same chunk hashes
+        // For files, copy chunk metadata (COW)
+        if !is_directory && file_size > 0 {
+            chunk_store.copy_chunks_for_cow(source_inode_id, new_inode_id, file_size).await?;
+        }
         
         // Get next cookie for directory entry
         let cookie_key = KeyCodec::dir_cookie_counter_key(dest_dir_id);

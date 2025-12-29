@@ -34,16 +34,7 @@ pub struct FileInode {
     /// File name in parent directory. None when file has multiple hardlinks.
     pub name: Option<Vec<u8>>,
     pub nlink: u32,
-    
-    /// Content-addressable chunk hashes (CAS)
-    /// Each chunk is stored by its BLAKE3 hash, enabling true COW and deduplication.
-    /// When None, falls back to legacy (inode_id, chunk_index) storage for backward compat.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunks: Option<Vec<ChunkHash>>,
 }
-
-/// BLAKE3 hash for content-addressable storage (32 bytes)
-pub type ChunkHash = [u8; 32];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectoryInode {

@@ -45,7 +45,6 @@ const KEY_TOMBSTONE_SIZE: usize = 17;
 pub enum KeyPrefix {
     Inode,
     Chunk,
-    ChunkCAS,  // Content-addressable chunks
     DirEntry,
     DirScan,
     Tombstone,
@@ -63,7 +62,6 @@ impl TryFrom<u8> for KeyPrefix {
         match byte {
             PREFIX_INODE => Ok(Self::Inode),
             PREFIX_CHUNK => Ok(Self::Chunk),
-            PREFIX_CHUNK_CAS => Ok(Self::ChunkCAS),
             PREFIX_DIR_ENTRY => Ok(Self::DirEntry),
             PREFIX_DIR_SCAN => Ok(Self::DirScan),
             PREFIX_TOMBSTONE => Ok(Self::Tombstone),
@@ -82,7 +80,6 @@ impl From<KeyPrefix> for u8 {
         match prefix {
             KeyPrefix::Inode => PREFIX_INODE,
             KeyPrefix::Chunk => PREFIX_CHUNK,
-            KeyPrefix::ChunkCAS => PREFIX_CHUNK_CAS,
             KeyPrefix::DirEntry => PREFIX_DIR_ENTRY,
             KeyPrefix::DirScan => PREFIX_DIR_SCAN,
             KeyPrefix::Tombstone => PREFIX_TOMBSTONE,
@@ -100,7 +97,6 @@ impl KeyPrefix {
         match self {
             Self::Inode => "INODE",
             Self::Chunk => "CHUNK",
-            Self::ChunkCAS => "CHUNK_CAS",
             Self::DirEntry => "DIR_ENTRY",
             Self::DirScan => "DIR_SCAN",
             Self::Tombstone => "TOMBSTONE",
@@ -144,14 +140,6 @@ impl KeyCodec {
         }
         let chunk_bytes: [u8; U64_SIZE] = key[KEY_INODE_SIZE..KEY_CHUNK_SIZE].try_into().ok()?;
         Some(u64::from_be_bytes(chunk_bytes))
-    }
-
-    /// Content-addressable storage: chunk key by BLAKE3 hash
-    pub fn chunk_key_by_hash(hash: &[u8; 32]) -> Bytes {
-        let mut key = Vec::with_capacity(1 + 32);
-        key.push(u8::from(KeyPrefix::ChunkCAS));
-        key.extend_from_slice(hash);
-        Bytes::from(key)
     }
 
     pub fn dir_entry_key(dir_id: InodeId, name: &[u8]) -> Bytes {
