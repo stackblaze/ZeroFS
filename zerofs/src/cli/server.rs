@@ -575,10 +575,6 @@ pub struct InitResult {
     pub db_path: String,
     pub db_handle: SlateDbHandle,
     pub maintenance_runtime: Option<tokio::runtime::Handle>,
-    pub writeback_flusher: Option<(
-        Arc<crate::fs::writeback_cache::WritebackCache>,
-        tokio::sync::mpsc::UnboundedReceiver<crate::fs::writeback_cache::FlushSignal>,
-    )>,
 }
 
 async fn initialize_filesystem(
@@ -657,33 +653,6 @@ async fn initialize_filesystem(
     )
     .await?;
 
-    // Initialize writeback cache if enabled
-    let writeback_flusher = if !db_mode.is_read_only()
-        && settings
-            .writeback
-            .as_ref()
-            .map(|w| w.enabled)
-            .unwrap_or(false)
-    {
-        let wb_config = settings.writeback.as_ref().unwrap();
-        info!(
-            "Initializing writeback cache: size={}MB",
-            (wb_config.max_bytes() / 1_000_000)
-        );
-
-        let (wb_cache, flush_rx) =
-            crate::fs::writeback_cache::WritebackCache::new(wb_config.max_bytes())
-                .map_err(|e| anyhow::anyhow!("Failed to initialize writeback cache: {}", e))?;
-
-        let wb_cache = Arc::new(wb_cache);
-        fs.writeback_cache = Some(Arc::clone(&wb_cache));
-
-        info!("Writeback cache initialized successfully");
-        Some((wb_cache, flush_rx))
-    } else {
-        None
-    };
-
     Ok(InitResult {
         fs: Arc::new(fs),
         checkpoint_params,
@@ -691,7 +660,6 @@ async fn initialize_filesystem(
         db_path: actual_db_path,
         db_handle,
         maintenance_runtime,
-        writeback_flusher,
     })
 }
 
@@ -753,26 +721,6 @@ pub async fn run_server(
     }
 
     let shutdown = CancellationToken::new();
-
-    // Start writeback flusher if enabled
-    let writeback_handle = if let Some((wb_cache, flush_rx)) = init_result.writeback_flusher {
-        let wb_config = settings.writeback.as_ref().unwrap();
-        let flusher = crate::fs::writeback_cache::WritebackFlusher::new(
-            wb_cache,
-            Arc::clone(&fs.db),
-            wb_config.flush_interval_secs(),
-            wb_config.flush_threshold_percent(),
-            wb_config.max_bytes(),
-        );
-        info!(
-            "Starting writeback flusher: interval={}s, threshold={}%",
-            wb_config.flush_interval_secs(),
-            wb_config.flush_threshold_percent()
-        );
-        Some(flusher.spawn(flush_rx, shutdown.clone()))
-    } else {
-        None
-    };
 
     let nfs_handles = start_nfs_servers(
         Arc::clone(&fs),
@@ -907,10 +855,6 @@ pub async fn run_server(
     if let Some(flush_handle) = flush_handle {
         let _ = flush_handle.await;
     }
-    if let Some(writeback_handle) = writeback_handle {
-        info!("Waiting for writeback flusher to complete final flush...");
-        let _ = writeback_handle.await;
-    }
     if let Some(checkpoint_handle) = checkpoint_handle {
         let _ = checkpoint_handle.await;
     }
@@ -920,14 +864,6 @@ pub async fn run_server(
         && let Err(e) = fs.flush_coordinator.flush().await
     {
         tracing::error!("Final flush failed: {:?}", e);
-    }
-
-    // Final writeback cache flush
-    if let Some(ref wb_cache) = fs.writeback_cache {
-        info!("Performing final writeback cache flush...");
-        if let Err(e) = wb_cache.flush_to_backend(&fs.db).await {
-            tracing::error!("Final writeback cache flush failed: {:?}", e);
-        }
     }
 
     if let Err(e) = fs.db.close().await {

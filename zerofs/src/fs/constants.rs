@@ -98,12 +98,6 @@ pub mod timeouts {
     /// - Network latency to cloud storage (S3, etc.)
     /// - Better to wait than to fail and lose data
     pub const DB_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
-
-    /// Timeout for writeback cache flush operations.
-    /// 
-    /// This is shorter because the writeback cache is typically smaller
-    /// and local to the server.
-    pub const CACHE_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 }
 
 /// Special inode IDs reserved for virtual filesystem entries

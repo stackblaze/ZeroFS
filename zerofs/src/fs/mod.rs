@@ -15,7 +15,6 @@ pub mod store;
 pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
-pub mod writeback_cache;
 
 use self::flush_coordinator::FlushCoordinator;
 use self::key_codec::KeyCodec;
@@ -26,7 +25,6 @@ use self::stats::{FileSystemGlobalStats, StatsShardData};
 use self::store::{ChunkStore, DatasetStore, DirectoryStore, InodeStore, TombstoneStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
-use self::writeback_cache::WritebackCache;
 use crate::config::CompressionConfig;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
@@ -103,7 +101,6 @@ pub struct ZeroFS {
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub flush_coordinator: FlushCoordinator,
     pub write_coordinator: Arc<WriteCoordinator>,
-    pub writeback_cache: Option<Arc<WritebackCache>>,
     pub max_bytes: u64,
     pub chunk_size: usize,
     pub tracer: AccessTracer,
@@ -217,7 +214,6 @@ impl ZeroFS {
             global_stats,
             flush_coordinator,
             write_coordinator,
-            writeback_cache: None,
             max_bytes,
             chunk_size: CHUNK_SIZE,
             tracer: AccessTracer::new(),
@@ -265,46 +261,29 @@ impl ZeroFS {
         Ok(())
         }
 
-    /// Internal version that can bypass writeback cache for critical operations
-    /// Set bypass_cache=true to write directly to backend (for metadata operations like create/mkdir/link)
+    /// Internal version for transaction commit
     pub async fn commit_transaction_internal(
         &self,
         mut txn: EncryptedTransaction,
         seq_guard: &mut SequenceGuard,
-        bypass_cache: bool,
+        _bypass_cache: bool,
     ) -> Result<(), FsError> {
         self.inode_store.save_counter(&mut txn);
 
         let (encrypt_result, _) = tokio::join!(txn.into_inner(), seq_guard.wait_for_predecessors());
         let prepared = encrypt_result.map_err(|_| FsError::IoError)?;
 
-        if bypass_cache {
-            // Write directly to backend, bypassing writeback cache
         self.db
             .write_raw_batch(
-                    prepared.batch,
-                    prepared.pending_operations,
-                    prepared.deleted_keys,
+                prepared.batch,
+                prepared.pending_operations,
+                prepared.deleted_keys,
                 &WriteOptions {
                     await_durable: false,
                 },
             )
             .await
             .map_err(|_| FsError::IoError)?;
-        } else {
-            // Normal path through writeback cache
-            self.db
-                .write_raw_batch(
-                    prepared.batch,
-                    prepared.pending_operations,
-                    prepared.deleted_keys,
-                    &WriteOptions {
-                        await_durable: false,
-                    },
-                )
-                .await
-                .map_err(|_| FsError::IoError)?;
-        }
 
         seq_guard.mark_committed();
         Ok(())
