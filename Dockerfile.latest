@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary
-COPY docker-build/zerofs-linux-amd64-pgo /usr/local/bin/zerofs
+COPY docker-build/zerofs /usr/local/bin/zerofs
 
 RUN chmod +x /usr/local/bin/zerofs
 
