@@ -70,6 +70,17 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: DatasetCommands,
     },
+    /// Clone a file or directory using COW (instant copy, no data duplication)
+    Clone {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Source path within ZeroFS (e.g., /mydir)
+        #[arg(long)]
+        source: String,
+        /// Destination path within ZeroFS (e.g., /mydir-copy)
+        #[arg(long)]
+        destination: String,
+    },
     /// Trace file system operations in real-time
     Fatrace {
         #[arg(short, long)]
@@ -345,17 +356,6 @@ pub enum DatasetCommands {
         #[arg(long)]
         source: String,
         /// Destination path to restore to (e.g., /tmp/restored-file.txt)
-        #[arg(long)]
-        destination: String,
-    },
-    /// Clone a file or directory using COW (instant copy, no data duplication)
-    Clone {
-        #[arg(short, long)]
-        config: PathBuf,
-        /// Source path within ZeroFS (e.g., /mydir)
-        #[arg(long)]
-        source: String,
-        /// Destination path within ZeroFS (e.g., /mydir-copy)
         #[arg(long)]
         destination: String,
     },
