@@ -120,6 +120,17 @@ impl ZeroFS {
         max_bytes: u64,
         compression: CompressionConfig,
     ) -> anyhow::Result<Self> {
+        Self::new_with_slatedb_and_writeback(slatedb, encryption_key, max_bytes, compression, None, None).await
+    }
+
+    pub async fn new_with_slatedb_and_writeback(
+        slatedb: crate::encryption::SlateDbHandle,
+        encryption_key: [u8; 32],
+        max_bytes: u64,
+        compression: CompressionConfig,
+        writeback_config: Option<crate::writeback_cache::WritebackCacheConfig>,
+        metadata_cache_config: Option<crate::config::MetadataCacheConfig>,
+    ) -> anyhow::Result<Self> {
         let encryptor = Arc::new(EncryptionManager::new(&encryption_key, compression));
 
         let lock_manager = Arc::new(LockManager::new());
@@ -188,9 +199,60 @@ impl ZeroFS {
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let write_coordinator = Arc::new(WriteCoordinator::new());
         let stats = Arc::new(FileSystemStats::new());
-        let chunk_store = ChunkStore::new(db.clone());
-        let directory_store = DirectoryStore::new(db.clone());
-        let inode_store = InodeStore::new(db.clone(), next_inode_id);
+        
+        // Initialize writeback cache if configured
+        let writeback_cache = if let Some(wb_config) = writeback_config {
+            info!("Initializing writeback cache at {}", wb_config.cache_dir.display());
+            Some(crate::writeback_cache::WritebackCache::new(wb_config, db.clone()).await?)
+        } else {
+            None
+        };
+        
+        let chunk_store = if let Some(ref cache) = writeback_cache {
+            ChunkStore::new_with_writeback(db.clone(), Arc::clone(cache))
+        } else {
+            ChunkStore::new(db.clone())
+        };
+        
+        // Initialize metadata cache if configured (enabled by default)
+        let metadata_cache = if let Some(ref meta_config) = metadata_cache_config {
+            if meta_config.enabled {
+                info!(
+                    "Initializing metadata cache: max_dir_entries={}, max_inodes={}, negative_ttl={}s",
+                    meta_config.max_dir_entries,
+                    meta_config.max_inodes,
+                    meta_config.negative_lookup_ttl_secs
+                );
+                Some(crate::metadata_cache::MetadataCache::new(
+                    meta_config.max_dir_entries,
+                    meta_config.max_inodes,
+                    meta_config.negative_lookup_ttl_secs,
+                ))
+            } else {
+                warn!("Metadata cache is disabled - this may cause high I/O wait for database workloads");
+                None
+            }
+        } else {
+            // Use defaults if not configured
+            info!("Using default metadata cache configuration");
+            Some(crate::metadata_cache::MetadataCache::new(
+                100000, // max_dir_entries
+                50000,  // max_inodes
+                5,      // negative_lookup_ttl_secs
+            ))
+        };
+        
+        let directory_store = if let Some(ref cache) = metadata_cache {
+            DirectoryStore::new_with_cache(db.clone(), Arc::clone(cache))
+        } else {
+            DirectoryStore::new(db.clone())
+        };
+        
+        let inode_store = if let Some(ref cache) = metadata_cache {
+            InodeStore::new_with_cache(db.clone(), next_inode_id, Arc::clone(cache))
+        } else {
+            InodeStore::new(db.clone(), next_inode_id)
+        };
         let tombstone_store = TombstoneStore::new(db.clone());
         
         // Initialize dataset store

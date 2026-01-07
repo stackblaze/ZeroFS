@@ -2,6 +2,8 @@ use crate::encryption::{EncryptedDb, EncryptedTransaction};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::key_codec::{KeyCodec, ParsedKey};
+use crate::fs::types::DirEntry;
+use crate::metadata_cache::MetadataCache;
 use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
@@ -118,14 +120,35 @@ pub struct DirEntryInfo {
 #[derive(Clone)]
 pub struct DirectoryStore {
     db: Arc<EncryptedDb>,
+    metadata_cache: Option<Arc<MetadataCache>>,
 }
 
 impl DirectoryStore {
     pub fn new(db: Arc<EncryptedDb>) -> Self {
-        Self { db }
+        Self {
+            db,
+            metadata_cache: None,
+        }
+    }
+
+    pub fn new_with_cache(db: Arc<EncryptedDb>, metadata_cache: Arc<MetadataCache>) -> Self {
+        Self {
+            db,
+            metadata_cache: Some(metadata_cache),
+        }
     }
 
     pub async fn get(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
+        // Check metadata cache first
+        if let Some(ref cache) = self.metadata_cache {
+            if let Some(cached_inode_id) = cache.get_dir_entry(dir_id, name) {
+                return match cached_inode_id {
+                    Some(inode_id) => Ok(inode_id),
+                    None => Err(FsError::NotFound), // Cached negative lookup
+                };
+            }
+        }
+        
         let entry_key = KeyCodec::dir_entry_key(dir_id, name);
         let name_str = String::from_utf8_lossy(name);
 
@@ -150,6 +173,10 @@ impl DirectoryStore {
                 FsError::IoError
             })?
             .ok_or_else(|| {
+                // Cache negative lookup
+                if let Some(ref cache) = self.metadata_cache {
+                    cache.put_dir_entry(dir_id, name, None);
+                }
                 tracing::error!(
                     "directory_store.get: entry not found for '{}' in dir {}",
                     name_str,
@@ -159,6 +186,23 @@ impl DirectoryStore {
             })?;
 
         let (inode_id, _cookie) = KeyCodec::decode_dir_entry(&entry_data)?;
+        
+        // Cache positive lookup - we'll cache just the inode_id for now
+        // The full DirEntry can be reconstructed from the inode if needed
+        if let Some(ref cache) = self.metadata_cache {
+            // Create a minimal DirEntry for caching (we only need fileid for lookups)
+            use crate::fs::types::{DirEntry, FileAttributes, FileType, Timestamp};
+            let entry = DirEntry {
+                fileid: inode_id,
+                name: name.to_vec(),
+                attr: FileAttributes {
+                    file_type: FileType::Regular, // Default, will be correct when inode is loaded
+                    ..Default::default()
+                },
+                cookie: 0, // Not needed for cache
+            };
+            cache.put_dir_entry(dir_id, name, Some(entry));
+        }
         
         tracing::debug!(
             "directory_store.get: found '{}' in dir {} -> inode {}",
@@ -322,6 +366,9 @@ impl DirectoryStore {
 
         let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
         txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
+        
+        // Invalidate cache for this entry (will be updated after transaction commits)
+        self.invalidate_entry(dir_id, name);
     }
 
     pub fn unlink_entry(
@@ -336,11 +383,33 @@ impl DirectoryStore {
 
         let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
         txn.delete_bytes(&scan_key);
+        
+        // Invalidate cache for this entry
+        self.invalidate_entry(dir_id, name);
     }
 
     pub fn delete_directory(&self, txn: &mut EncryptedTransaction, dir_id: InodeId) {
         let counter_key = KeyCodec::dir_cookie_counter_key(dir_id);
         txn.delete_bytes(&counter_key);
+        
+        // Invalidate all directory entries for this directory
+        if let Some(ref cache) = self.metadata_cache {
+            cache.invalidate_dir_entries(dir_id);
+        }
+    }
+    
+    /// Invalidate cache for a specific directory entry (called after create/delete/rename)
+    pub fn invalidate_entry(&self, dir_id: InodeId, name: &[u8]) {
+        if let Some(ref cache) = self.metadata_cache {
+            cache.invalidate_dir_entry(dir_id, name);
+        }
+    }
+    
+    /// Invalidate all entries in a directory (called when directory is modified)
+    pub fn invalidate_directory(&self, dir_id: InodeId) {
+        if let Some(ref cache) = self.metadata_cache {
+            cache.invalidate_dir_entries(dir_id);
+        }
     }
 
     pub async fn get_entry_with_cookie(

@@ -1,4 +1,4 @@
-FROM rust:1.92.0-slim-trixie AS builder
+FROM rust:1.83-bullseye AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -9,18 +9,19 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /usr/src
 
-COPY zerofs/Cargo.toml zerofs/Cargo.lock ./zerofs/
+COPY zerofs/Cargo.toml zerofs/Cargo.lock zerofs/build.rs ./zerofs/
 COPY zerofs/src ./zerofs/src
+COPY zerofs/proto ./zerofs/proto
 
 WORKDIR /usr/src/zerofs
 
 RUN cargo build --release
 
-FROM debian:trixie-slim
+FROM debian:bullseye-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl3t64 \
+    libssl1.1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/zerofs/target/release/zerofs /usr/local/bin/zerofs

@@ -2,6 +2,7 @@ use crate::encryption::{EncryptedDb, EncryptedTransaction};
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::{CHUNK_SIZE, FsError};
+use crate::writeback_cache::WritebackCache;
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::HashMap;
@@ -14,14 +15,36 @@ const ZERO_CHUNK: &[u8] = &[0u8; CHUNK_SIZE];
 #[derive(Clone)]
 pub struct ChunkStore {
     db: Arc<EncryptedDb>,
+    writeback_cache: Option<Arc<WritebackCache>>,
 }
 
 impl ChunkStore {
     pub fn new(db: Arc<EncryptedDb>) -> Self {
-        Self { db }
+        Self { 
+            db,
+            writeback_cache: None,
+        }
+    }
+
+    pub fn new_with_writeback(db: Arc<EncryptedDb>, writeback_cache: Arc<WritebackCache>) -> Self {
+        Self {
+            db,
+            writeback_cache: Some(writeback_cache),
+        }
     }
 
     pub async fn get(&self, id: InodeId, chunk_idx: u64) -> Result<Option<Bytes>, FsError> {
+        // Try writeback cache first if enabled
+        if let Some(ref cache) = self.writeback_cache {
+            match cache.get(id, chunk_idx).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    error!("Writeback cache get error: {}, falling back to DB", e);
+                }
+            }
+        }
+
+        // Fall back to direct DB access
         let key = KeyCodec::chunk_key(id, chunk_idx);
         match self.db.get_bytes(&key).await {
             Ok(result) => Ok(result),
@@ -36,11 +59,37 @@ impl ChunkStore {
     }
 
     fn save(&self, txn: &mut EncryptedTransaction, id: InodeId, chunk_idx: u64, data: Bytes) {
+        // If writeback cache is enabled, write to cache instead of transaction
+        if let Some(ref cache) = self.writeback_cache {
+            // Spawn async task to write to cache (non-blocking)
+            let cache_clone = Arc::clone(cache);
+            let data_clone = data.clone();
+            tokio::spawn(async move {
+                if let Err(e) = cache_clone.put(id, chunk_idx, data_clone).await {
+                    error!("Failed to write to writeback cache: {}", e);
+                }
+            });
+            // Don't add to transaction - writeback cache will handle persistence
+            return;
+        }
+
+        // No writeback cache - write directly to transaction
         let key = KeyCodec::chunk_key(id, chunk_idx);
         txn.put_bytes(&key, data);
     }
 
     pub fn delete(&self, txn: &mut EncryptedTransaction, id: InodeId, chunk_idx: u64) {
+        // If writeback cache is enabled, delete from cache
+        if let Some(ref cache) = self.writeback_cache {
+            let cache_clone = Arc::clone(cache);
+            tokio::spawn(async move {
+                if let Err(e) = cache_clone.delete(id, chunk_idx).await {
+                    error!("Failed to delete from writeback cache: {}", e);
+                }
+            });
+        }
+
+        // Always add to transaction for immediate consistency
         let key = KeyCodec::chunk_key(id, chunk_idx);
         txn.delete_bytes(&key);
     }

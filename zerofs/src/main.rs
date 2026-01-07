@@ -19,6 +19,8 @@ mod rpc;
 mod http;
 mod storage_compatibility;
 mod task;
+mod writeback_cache;
+mod metadata_cache;
 
 #[cfg(test)]
 mod test_helpers;

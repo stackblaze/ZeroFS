@@ -27,7 +27,7 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const CHECKPOINT_REFRESH_INTERVAL_SECS: u64 = 10;
 
@@ -644,12 +644,78 @@ async fn initialize_filesystem(
 
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
+    // Configure writeback cache if enabled
+    let writeback_config = settings.cache.writeback.as_ref().and_then(|wb| {
+        if wb.enabled {
+            // Check for preset configuration
+            let config = match wb.preset.as_deref() {
+                Some("postgresql") => {
+                    info!("Using PostgreSQL-optimized writeback cache configuration");
+                    crate::writeback_cache::WritebackCacheConfig::for_postgresql(
+                        wb.dir.clone(),
+                        wb.size_gb,
+                    )
+                }
+                Some("high_throughput") => {
+                    info!("Using high-throughput database writeback cache configuration");
+                    crate::writeback_cache::WritebackCacheConfig::for_high_throughput_db(
+                        wb.dir.clone(),
+                        wb.size_gb,
+                    )
+                }
+                Some("analytics") => {
+                    info!("Using analytics/OLAP database writeback cache configuration");
+                    crate::writeback_cache::WritebackCacheConfig::for_analytics_db(
+                        wb.dir.clone(),
+                        wb.size_gb,
+                    )
+                }
+                Some(other) => {
+                    warn!("Unknown writeback cache preset '{}', using custom configuration", other);
+                    crate::writeback_cache::WritebackCacheConfig {
+                        cache_dir: wb.dir.clone(),
+                        max_cache_size_bytes: (wb.size_gb * 1_000_000_000.0) as u64,
+                        max_dirty_chunks: wb.max_dirty_chunks,
+                        flush_interval_secs: wb.flush_interval_secs,
+                        max_concurrent_flushes: wb.max_concurrent_flushes,
+                        dirty_time_threshold_secs: wb.dirty_time_threshold_secs,
+                        use_direct_io: false,
+                        cache_reads_aggressively: false,
+                        read_cache_percentage: 30,
+                    }
+                }
+                None => {
+                    // Custom configuration
+                    crate::writeback_cache::WritebackCacheConfig {
+                        cache_dir: wb.dir.clone(),
+                        max_cache_size_bytes: (wb.size_gb * 1_000_000_000.0) as u64,
+                        max_dirty_chunks: wb.max_dirty_chunks,
+                        flush_interval_secs: wb.flush_interval_secs,
+                        max_concurrent_flushes: wb.max_concurrent_flushes,
+                        dirty_time_threshold_secs: wb.dirty_time_threshold_secs,
+                        use_direct_io: false,
+                        cache_reads_aggressively: false,
+                        read_cache_percentage: 30,
+                    }
+                }
+            };
+            Some(config)
+        } else {
+            None
+        }
+    });
+
+    // Configure metadata cache if enabled
+    let metadata_cache_config = settings.cache.metadata.clone();
+
     let db_handle = slatedb.clone();
-    let mut fs = ZeroFS::new_with_slatedb(
+    let mut fs = ZeroFS::new_with_slatedb_and_writeback(
         slatedb,
         encryption_key,
         settings.max_bytes(),
         settings.compression(),
+        writeback_config,
+        metadata_cache_config,
     )
     .await?;
 
